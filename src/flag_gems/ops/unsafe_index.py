@@ -148,15 +148,13 @@ def generate_unsafe_index_kernel(
         return _generate_segment_kernel(
             inp_rank, indices_len, index_rank, kernel_name, code
         )
-    code.writeline("@libentry()")
-    code.writeline("@libtuner(")
-    with code.indent():
-        code.writeline('configs=runtime.get_tuned_config("index"),')
-        code.writeline('key=["M", "N"],')
-        code.writeline('strategy=["align32", "align32"],')
-        code.writeline("warmup=5,")
-        code.writeline("rep=10,")
-    code.writeline(")")
+    # No @libentry/@libtuner decorators on this launch-bound kernel: profiling
+    # showed @libentry alone adds ~12.5us and @libtuner ~2us of CPU dispatch per
+    # call.  On these tiny all-tensor shapes that host dispatch exceeds
+    # do_bench's L2-flush hide window, so it leaks into the benchmark and also
+    # makes it noisy.  A bare @triton.jit (kernel compile/caching is still
+    # handled by triton's JITFunction) keeps dispatch minimal; the M-based
+    # BLOCK_SIZE0 heuristic below replaces the autotuner deterministically.
     code.writeline("@triton.jit")
     code.writeline(f"def {kernel_name}(")
     with code.indent():
@@ -274,11 +272,10 @@ def generate_index_wrapper(
         code.writeline("M = indices[0].numel()")
         code.writeline(f"N = volume(input_shape[{indices_len}: ])")
         code.newline()
-        code.writeline("grid = lambda meta: (")
-        with code.indent():
-            code.writeline("triton.cdiv(M, meta['BLOCK_SIZE0']), ")
-            code.writeline("triton.cdiv(N, meta['BLOCK_SIZE1']), ")
-        code.writeline(")")
+        code.writeline(
+            "BLOCK_SIZE0 = 1024 if M >= 4096 else (256 if M >= 64 else 64)"
+        )
+        code.writeline("grid = (triton.cdiv(M, BLOCK_SIZE0), triton.cdiv(N, 1024))")
         code.newline()
         code.writeline(f"{kernel_name}[grid](")
         with code.indent():
@@ -294,7 +291,12 @@ def generate_index_wrapper(
             args += [
                 f"out_stride[{i}]," for i in range(index_rank + inp_rank - indices_len)
             ]
-            args += ["M,", "N,"]
+            args += [
+                "M,",
+                "N,",
+                "BLOCK_SIZE0=BLOCK_SIZE0,",
+                "BLOCK_SIZE1=1024,",
+            ]
             code.writelines(args)
         code.writeline(")")
         code.writeline("return input")
@@ -383,32 +385,49 @@ def _unsafe_index(inp, indices):
     if not indices:
         raise ValueError("at least one index must be provided")
 
-    indices = [
-        index.to(inp.device)
-        if index is not None and index.device != inp.device
-        else index
-        for index in indices
-    ]
-
-    # _unsafe_index rejects bool/int8 masks (unlike index, which converts them).
+    # Single pass: validate dtype (_unsafe_index rejects bool/int8 masks, unlike
+    # ``index`` which converts them) and move cross-device indices.  Done in one
+    # loop to cut per-call host overhead -- on Hopper these ops are otherwise
+    # launch-overhead bound and the host dispatch was a measurable fraction of
+    # the total latency on small shapes.
     processed_indices = []
-    for i, index in enumerate(indices):
-        if index is not None:
-            if index.dtype in [torch.int8, torch.bool]:
-                raise IndexError("_unsafe_index does not support bool or int8 masks")
-            if index.dtype not in [torch.long, torch.int, torch.int32, torch.int64]:
-                raise TypeError(
-                    "tensors used as indices must be long, int, byte or bool tensors"
-                )
-            processed_indices.append(index)
-        else:
+    for index in indices:
+        if index is None:
             processed_indices.append(None)
+            continue
+        dt = index.dtype
+        if dt in (torch.int8, torch.bool):
+            raise IndexError("_unsafe_index does not support bool or int8 masks")
+        if dt not in (torch.long, torch.int, torch.int32, torch.int64):
+            raise TypeError(
+                "tensors used as indices must be long, int, byte or bool tensors"
+            )
+        if index.device != inp.device:
+            index = index.to(inp.device)
+        processed_indices.append(index)
     indices = processed_indices
 
     if len(indices) > inp.ndim:
         raise IndexError(
             f"too many indices for tensor of dimension {inp.ndim} (got {len(indices)})"
         )
+
+    # Fast path: every index is a tensor (no None).  The indexed dims are then a
+    # leading contiguous block, the trailing dims are implicit-None, the subspace
+    # is already contiguous and no transpose / post-process permute is needed --
+    # so we can skip the None-padding, subspace check and shape-splitting loops
+    # below.  This is by far the common case and, on Hopper, the host dispatch
+    # those loops add is a large fraction of total latency on small shapes.
+    if all(idx is not None for idx in indices):
+        n = len(indices)
+        tensor_indices = (
+            list(torch.broadcast_tensors(*indices)) if n > 1 else list(indices)
+        )
+        out_shape = list(tensor_indices[0].shape) + list(inp.shape[n:])
+        out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
+        if out.numel() != 0:
+            _unsafe_index_func(inp, tensor_indices, out)
+        return out
 
     has_any_tensor = any(idx is not None for idx in indices)
     starts_with_none = indices[0] is None if indices else False
@@ -484,27 +503,25 @@ def _unsafe_index(inp, indices):
     out_shape = before_shape + replacement_shape + after_shape
     out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
 
-    tensor_indices = [idx for idx in indices if idx is not None]
+    # ``tensor_indices`` (broadcast above) already holds exactly the non-None
+    # tensors in the order the kernel consumes them: the contiguous-subspace
+    # transpose above is a *stable* partition (tensors keep their relative
+    # order), so recomputing it from ``indices`` would yield the same list.
     if not tensor_indices:
         return inp.view(*out_shape).contiguous()
 
-    # Route by pattern:
-    #   * all-tensor (num_indices == ndim): code-gen kernel (fastest for
-    #     all-tensor gathers).  Negatives are pre-wrapped on the host because
-    #     the generated kernel has no per-dim wrap (and an in-kernel tl.where
-    #     made triton-ascend's TBE fail on rank>=4 variants).
-    #   * single index: 1D segments fast path.
-    #   * multi index (2+ tensor indices, < ndim): general contiguous-segments
-    #     kernel.  The code-gen 2D-broadcast kernel is pathological (element
-    #     store) on large post and crashes the NPU on some rank-4 None-mixed
-    #     patterns, so multi-index uses the robust segments path instead.
-    num_indices = len(tensor_indices)
-    # Skip the kernel launch for an empty output (empty index -> grid (0, ...)
-    # would fault the NPU with coreDim=0); the post-process permute below still
-    # runs to produce the correct output shape.
+    # The generated kernel is selected at code-gen time by the
+    # (inp_rank, indices_len, index_rank) key:
+    #   * indices_len == inp_rank (all-tensor) -> 2D gather kernel.
+    #   * indices_len <  inp_rank (multi-index) -> 1D contiguous-segment kernel
+    #     (the 2D-broadcast form degrades to per-element stores on a large post
+    #     dimension and is much slower).
+    # Both kernels wrap negative indices in-kernel (tl.where), so no host
+    # neg-wrap is needed.
+    # Skip the kernel launch for an empty output: an empty index would give a
+    # grid of (0, ...) programs and fault the device; the post-process permute
+    # below still runs to produce the correct output shape.
     if out.numel() != 0:
-        # Both the 2D all-tensor kernel and the 1D-segment multi-index kernel
-        # wrap negative indices in-kernel (tl.where), so no host neg-wrap needed.
         _unsafe_index_func(inp, tensor_indices, out)
 
     if need_post_process:
@@ -513,6 +530,9 @@ def _unsafe_index(inp, indices):
         broadcast_dims = list(range(index_rank))
         post_dims = list(range(index_rank + first_tensor_dim, out.ndim))
         new_order = pre_dims + broadcast_dims + post_dims
-        out = out.permute(new_order)
+        return out.permute(new_order).contiguous()
 
-    return out.contiguous()
+    # ``out`` was just allocated contiguous and the kernel wrote it in order; no
+    # copy is needed (the previous unconditional ``.contiguous()`` only added a
+    # redundant dispatch on the common path).
+    return out
