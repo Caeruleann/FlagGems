@@ -1,16 +1,12 @@
 import importlib
 import logging
 import os
-from typing import Any, Callable, List, Mapping, Tuple
+from typing import Any, Callable, Mapping, Tuple
 
 import torch
-import triton
-import triton.language as tl
 
-from flag_gems.utils import libentry
 from flag_gems.utils.code_cache import code_cache_dir
 from flag_gems.utils.code_utils import IndentedBuffer, write_atomic
-from flag_gems.utils.shape_utils import volume
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +82,9 @@ def _generate_segment_kernel(
         # 1D contiguous post segment
         code.writeline("offsets = pid1 * BLOCK_SIZE1 + tl.arange(0, BLOCK_SIZE1)")
         code.writeline("mask = offsets < N")
-        code.writeline("v = tl.load(input_ptr + input_offset + offsets, mask=mask, other=0.0)")
+        code.writeline(
+            "v = tl.load(input_ptr + input_offset + offsets, mask=mask, other=0.0)"
+        )
         code.writeline("tl.store(out_ptr + pid0 * N + offsets, v, mask=mask)")
     code.newline()
     code.newline()
@@ -260,9 +258,7 @@ def generate_index_wrapper(
         code.writeline("M = indices[0].numel()")
         code.writeline(f"N = volume(input_shape[{indices_len}: ])")
         code.newline()
-        code.writeline(
-            "BLOCK_SIZE0 = 1024 if M >= 4096 else (256 if M >= 64 else 64)"
-        )
+        code.writeline("BLOCK_SIZE0 = 1024 if M >= 4096 else (256 if M >= 64 else 64)")
         code.writeline("grid = (triton.cdiv(M, BLOCK_SIZE0), triton.cdiv(N, 1024))")
         code.newline()
         code.writeline(f"{kernel_name}[grid](")
