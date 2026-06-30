@@ -204,7 +204,6 @@ from flag_gems.ops.hypot import hypot, hypot_out
 from flag_gems.ops.i0 import i0, i0_out
 from flag_gems.ops.i0_ import i0_
 from flag_gems.ops.index import index
-from flag_gems.ops.unsafe_index import _unsafe_index
 from flag_gems.ops.index_add import index_add, index_add_
 from flag_gems.ops.index_copy_ import index_copy, index_copy_
 from flag_gems.ops.index_put import _index_put_impl_, index_put, index_put_
@@ -432,6 +431,7 @@ from flag_gems.ops.uniform import uniform_
 from flag_gems.ops.unique import _unique2
 from flag_gems.ops.unique_consecutive import unique_consecutive
 from flag_gems.ops.unique_dim import unique_dim
+from flag_gems.ops.unsafe_index import _unsafe_index
 from flag_gems.ops.upsample_bicubic2d import upsample_bicubic2d
 from flag_gems.ops.upsample_bicubic2d_aa import _upsample_bicubic2d_aa
 from flag_gems.ops.upsample_bicubic2d_aa_backward import _upsample_bicubic2d_aa_backward
@@ -479,6 +479,7 @@ __all__ = [
     "_segment_reduce_backward",
     "_segment_reduce_backward_out",
     "_unique2",
+    "_unsafe_index",
     "_unsafe_masked_index",
     "_upsample_bicubic2d_aa",
     "_upsample_bicubic2d_aa_backward",
@@ -716,7 +717,6 @@ __all__ = [
     "i0",
     "i0_",
     "i0_out",
-    "_unsafe_index",
     "index",
     "index_add",
     "index_add_",

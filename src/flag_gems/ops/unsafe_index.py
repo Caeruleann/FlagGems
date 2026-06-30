@@ -1,15 +1,3 @@
-"""
-Code-generated ``_unsafe_index`` (self-contained, references index.py's
-code-generation mechanism).
-
-Two differences from the safe ``index`` generated kernel:
-  1. ``bool`` / ``int8`` masks are **rejected** (aten._unsafe_index semantics).
-  2. The generated kernel skips the per-element bounds-check ``index_mask`` and
-     wraps negative indices per-dimension (``idx + dim`` when ``idx < 0``).
-
-For each (inp_rank, indices_len, index_rank) combination a specialized Triton
-kernel is emitted into the code cache and imported, then reused on later calls.
-"""
 import importlib
 import logging
 import os
