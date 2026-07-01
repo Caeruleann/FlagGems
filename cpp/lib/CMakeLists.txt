@@ -19,6 +19,7 @@ add_library(operators
             zeros.cpp
             utils.cpp
             sum.cpp
+            pairwise_distance.cpp
             max.cpp
             mm.cpp
             rms_norm.cpp

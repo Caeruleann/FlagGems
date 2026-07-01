@@ -629,6 +629,32 @@ weight_norm_kernel:
   - 1024
   - 2048
 
+pairwise_distance:
+# per-D tiles (do_bench sweep on 910B). libtuner autotunes one best config per D.
+# tiny D: many rows amortize launch, small bd aligned to D
+- META: {BLOCK_M: 16, BLOCK_D: 128}
+  num_warps: 4
+# small-medium D
+- META: {BLOCK_M: 8, BLOCK_D: 256}
+  num_warps: 4
+# medium D
+- META: {BLOCK_M: 8, BLOCK_D: 1024}
+  num_warps: 4
+# medium-large D
+- META: {BLOCK_M: 4, BLOCK_D: 2048}
+  num_warps: 4
+# large D, small N
+- META: {BLOCK_M: 2, BLOCK_D: 2048}
+  num_warps: 4
+# very large D
+- META: {BLOCK_M: 1, BLOCK_D: 2048}
+  num_warps: 4
+# very large D, big chunk (fewer loop iters; bm=1 fits UB at bd=4096/8192)
+- META: {BLOCK_M: 1, BLOCK_D: 4096}
+  num_warps: 4
+- META: {BLOCK_M: 1, BLOCK_D: 8192}
+  num_warps: 4
+
 vector_norm:
 - META:
     BLOCK_M: 8

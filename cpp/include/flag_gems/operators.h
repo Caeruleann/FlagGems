@@ -131,6 +131,11 @@ at::Tensor softmax_backward(const at::Tensor &grad_output,
                             const at::Tensor &output,
                             int64_t dim,
                             at::ScalarType input_dtype);
+at::Tensor pairwise_distance(const at::Tensor &x1,
+                             const at::Tensor &x2,
+                             double p = 2.0,
+                             double eps = 1e-6,
+                             bool keepdim = false);
 at::Tensor fp8_matmul(const at::Tensor &a,
                       const at::Tensor &a_s,
                       const at::Tensor &b,
