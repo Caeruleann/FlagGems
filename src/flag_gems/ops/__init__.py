@@ -327,6 +327,7 @@ from flag_gems.ops.not_equal import not_equal, not_equal_scalar
 from flag_gems.ops.one_hot import one_hot
 from flag_gems.ops.ones import ones
 from flag_gems.ops.ones_like import ones_like
+from flag_gems.ops.pairwise_distance import pairwise_distance
 from flag_gems.ops.pad import constant_pad_nd, pad
 from flag_gems.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
@@ -906,6 +907,7 @@ __all__ = [
     "ones",
     "ones_like",
     "pad",
+    "pairwise_distance",
     "per_token_group_quant_fp8",
     "pixel_shuffle",
     "pixel_unshuffle",
