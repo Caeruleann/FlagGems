@@ -11,12 +11,12 @@ def pairwise_distance_input_fn(shape, dtype, device):
     # (which does N, D = x1.shape and reduces over D).
     inp1 = utils.generate_tensor_input(shape, dtype, device)
     inp2 = utils.generate_tensor_input(shape, dtype, device)
-    yield inp1, inp2
+    yield inp1, inp2  # default p=2.0
 
     if base.Config.bench_level == consts.BenchLevel.COMPREHENSIVE:
-        # The gems kernel only implements the p=2 (Euclidean) path, so vary
-        # eps (still hits the same kernel) rather than p.
-        yield inp1, inp2, {"eps": 1e-6}
+        # Arbitrary real p is supported; sweep several p values plus eps.
+        for p in (1.0, 3.0, 4.0, 0.5):
+            yield inp1, inp2, {"p": p}
         yield inp1, inp2, {"eps": 0.0}
 
 
