@@ -25,6 +25,7 @@ SHAPES = [
     (7,),  # 1-D: a single pair of D-dim vectors -> scalar output
     (64, 64),
     (1024, 257),
+    (1, 10000000)
 ]
 
 
@@ -64,7 +65,7 @@ BROADCAST_SHAPES = [
 
 @pytest.mark.pairwise_distance
 @pytest.mark.parametrize("x1_shape, x2_shape", BROADCAST_SHAPES)
-@pytest.mark.parametrize("p", [2.0, 1.0, 3.0])
+@pytest.mark.parametrize("p", P_LIST)
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_pairwise_distance_broadcast(x1_shape, x2_shape, p, dtype):
     torch.manual_seed(0)
@@ -92,7 +93,7 @@ NDIM_GE3_SHAPES = [
 
 @pytest.mark.pairwise_distance
 @pytest.mark.parametrize("shape", NDIM_GE3_SHAPES)
-@pytest.mark.parametrize("p", [2.0, 1.0, 3.0])
+@pytest.mark.parametrize("p", P_LIST)
 @pytest.mark.parametrize("keepdim", [False, True])
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_pairwise_distance_ndim3plus(shape, p, keepdim, dtype):
@@ -127,7 +128,7 @@ BROADCAST_NDIM3_SHAPES = [
 
 @pytest.mark.pairwise_distance
 @pytest.mark.parametrize("x1_shape, x2_shape", BROADCAST_NDIM3_SHAPES)
-@pytest.mark.parametrize("p", [2.0, 1.0, 3.0])
+@pytest.mark.parametrize("p", P_LIST)
 @pytest.mark.parametrize("keepdim", [False, True])
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_pairwise_distance_broadcast_ndim3plus(x1_shape, x2_shape, p, keepdim, dtype):

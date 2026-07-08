@@ -24,7 +24,7 @@ PAIRWISE_DISTANCE_CONFIGS = [
 @libentry()
 @libtuner(configs=PAIRWISE_DISTANCE_CONFIGS, key=["D"])
 @triton.jit
-def pairwise_distance_kernel(
+def pairwise_distance_general_kernel(
     x1_ptr, x2_ptr, out_ptr, D, eps, p, BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
@@ -135,6 +135,96 @@ def pairwise_distance_p2_kernel_2(
 
     tl.store(out_ptr + pid, sum)
 
+@libentry()
+@triton.jit
+def pairwise_distance_p1_kernel_1(
+    x1_ptr, x2_ptr, mid_ptr, D, eps, MID_SIZE, BLOCK_SIZE: tl.constexpr
+):
+    pid_n = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    offset = pid_d * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    base = pid_n * D
+    mask = offset < D
+    a = tl.load(x1_ptr + base + offset, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(x2_ptr + base + offset, mask=mask, other=0.0).to(tl.float32)
+    diff = tl.abs(a - b + eps)
+    mid = tl.sum(tl.where(mask, diff, 0.0))
+    tl.store(mid_ptr + pid_n * MID_SIZE + pid_d, mid)
+
+
+@libentry()
+@triton.jit
+def pairwise_distance_p1_kernel_2(
+    mid_ptr, out_ptr, MID_SIZE, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offset = tl.arange(0, BLOCK_SIZE)
+    mask = offset < MID_SIZE
+    mid = tl.load(mid_ptr + pid * MID_SIZE + offset, mask=mask, other=0.0)
+    sum = tl.sum(mid)
+
+    tl.store(out_ptr + pid, sum)
+
+@libentry()
+@triton.jit
+def pairwise_distance_p0_kernel_1(
+    x1_ptr, x2_ptr, mid_ptr, D, eps, MID_SIZE, BLOCK_SIZE: tl.constexpr
+):
+    pid_n = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    offset = pid_d * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    base = pid_n * D
+    mask = offset < D
+    a = tl.load(x1_ptr + base + offset, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(x2_ptr + base + offset, mask=mask, other=0.0).to(tl.float32)
+    diff = tl.abs(a - b + eps)
+    mid = tl.sum(tl.where(mask, (diff != 0).to(tl.float32), 0.0))
+    tl.store(mid_ptr + pid_n * MID_SIZE + pid_d, mid)
+
+
+@libentry()
+@triton.jit
+def pairwise_distance_p0_kernel_2(
+    mid_ptr, out_ptr, MID_SIZE, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offset = tl.arange(0, BLOCK_SIZE)
+    mask = offset < MID_SIZE
+    mid = tl.load(mid_ptr + pid * MID_SIZE + offset, mask=mask, other=0.0)
+    sum = tl.sum(mid)
+
+    tl.store(out_ptr + pid, sum)
+
+@libentry()
+@triton.jit
+def pairwise_distance_general_kernel_1(
+    x1_ptr, x2_ptr, mid_ptr, D, eps, p, MID_SIZE, BLOCK_SIZE: tl.constexpr
+):
+    pid_n = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    offset = pid_d * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    base = pid_n * D
+    mask = offset < D
+    a = tl.load(x1_ptr + base + offset, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(x2_ptr + base + offset, mask=mask, other=0.0).to(tl.float32)
+    diff = tl.abs(a - b + eps)
+    mid = tl.sum(tl.where(mask, pow(diff, p), 0.0))
+    tl.store(mid_ptr + pid_n * MID_SIZE + pid_d, mid)
+
+
+@libentry()
+@triton.jit
+def pairwise_distance_general_kernel_2(
+    mid_ptr, out_ptr, p, MID_SIZE, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offset = tl.arange(0, BLOCK_SIZE)
+    mask = offset < MID_SIZE
+    mid = tl.load(mid_ptr + pid * MID_SIZE + offset, mask=mask, other=0.0)
+    sum = pow(tl.sum(mid), 1 / p)
+
+    tl.store(out_ptr + pid, sum)
+
 def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
     logger.debug("GEMS PAIRWISE_DISTANCE")
     # 按需广播/连续化:同形+连续是常见情况,无条件 broadcast_tensors + contiguous 会
@@ -165,10 +255,34 @@ def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
             pairwise_distance_p2_kernel_1[(N, MID_SIZE)](x1, x2, mid, D, eps, MID_SIZE, BLOCK_SIZE)
             pairwise_distance_p2_kernel_2[(N,)](mid, out, MID_SIZE, BLOCK_MID)
     elif p == 1.0:
-        pairwise_distance_p1_kernel[grid](x1, x2, out, D, eps)
+        if N >= 1024 or D < 8192:
+            pairwise_distance_p1_kernel[grid](x1, x2, out, D, eps)
+        else:
+            BLOCK_SIZE = 1024
+            MID_SIZE = triton.cdiv(D, BLOCK_SIZE)
+            BLOCK_MID = triton.next_power_of_2(MID_SIZE)
+            mid = torch.empty((N, MID_SIZE), device=x1.device, dtype=torch.float32)
+            pairwise_distance_p1_kernel_1[(N, MID_SIZE)](x1, x2, mid, D, eps, MID_SIZE, BLOCK_SIZE)
+            pairwise_distance_p1_kernel_2[(N,)](mid, out, MID_SIZE, BLOCK_MID)
     elif p == 0.0:
-        pairwise_distance_p0_kernel[grid](x1, x2, out, D, eps)
+        if N >= 1024 or D < 8192:
+            pairwise_distance_p0_kernel[grid](x1, x2, out, D, eps)
+        else:
+            BLOCK_SIZE = 1024
+            MID_SIZE = triton.cdiv(D, BLOCK_SIZE)
+            BLOCK_MID = triton.next_power_of_2(MID_SIZE)
+            mid = torch.empty((N, MID_SIZE), device=x1.device, dtype=torch.float32)
+            pairwise_distance_p0_kernel_1[(N, MID_SIZE)](x1, x2, mid, D, eps, MID_SIZE, BLOCK_SIZE)
+            pairwise_distance_p0_kernel_2[(N,)](mid, out, MID_SIZE, BLOCK_MID)
     else:
-        pairwise_distance_kernel[grid](x1, x2, out, D, eps, p)
+        if N >= 1024 or D < 8192:
+            pairwise_distance_general_kernel[grid](x1, x2, out, D, eps, p)
+        else:
+            BLOCK_SIZE = 1024
+            MID_SIZE = triton.cdiv(D, BLOCK_SIZE)
+            BLOCK_MID = triton.next_power_of_2(MID_SIZE)
+            mid = torch.empty((N, MID_SIZE), device=x1.device, dtype=torch.float32)
+            pairwise_distance_general_kernel_1[(N, MID_SIZE)](x1, x2, mid, D, eps, p, MID_SIZE, BLOCK_SIZE)
+            pairwise_distance_general_kernel_2[(N,)](mid, out, p, MID_SIZE, BLOCK_MID)
 
     return out
