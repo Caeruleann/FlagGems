@@ -14,7 +14,7 @@ def pairwise_distance_input_fn(shape, dtype, device):
 
     if base.Config.bench_level == consts.BenchLevel.COMPREHENSIVE:
         # Arbitrary real p is supported; sweep several p values plus eps.
-        for p in (0.0, 1.0, 2.0, 10.5):
+        for p in (-2, -1, 0.0, 1.0, 2.0, 10.5):
             yield inp1, inp2, {"p": p}
     else:
         yield inp1, inp2 # default p=2.0
