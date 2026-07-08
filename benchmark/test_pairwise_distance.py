@@ -31,6 +31,7 @@ class PairwiseDistanceBenchmark(base.GenericBenchmark2DOnly):
             (1, 65536),
             (8, 65536),
             (64, 65536),
+            (1, 10000000)
         ]
         return shapes
 
