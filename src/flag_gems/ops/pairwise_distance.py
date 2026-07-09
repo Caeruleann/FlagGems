@@ -106,6 +106,45 @@ def pairwise_distance_p0_kernel(
     tl.store(out_ptr + pid, acc)
 
 @libentry()
+@libtuner(configs=PAIRWISE_DISTANCE_CONFIGS, key=["D"])
+@triton.jit
+def pairwise_distance_max_kernel(
+    x1_ptr, x2_ptr, out_ptr, D, eps, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    x1_ptr = x1_ptr + pid * D
+    x2_ptr = x2_ptr + pid * D
+    max_val = -float("inf")
+    for start in range(0, D, BLOCK_SIZE):
+        cols = start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        a = tl.load(x1_ptr + cols, mask=mask, other=0)
+        b = tl.load(x2_ptr + cols, mask=mask, other=0)
+        diff = tl.abs(a - b + eps)
+        max_val = tl.maximum(max_val, tl.max(tl.where(mask, diff, -float("inf"))))
+    tl.store(out_ptr + pid, max_val)
+
+@libentry()
+@libtuner(configs=PAIRWISE_DISTANCE_CONFIGS, key=["D"])
+@triton.jit
+def pairwise_distance_min_kernel(
+    x1_ptr, x2_ptr, out_ptr, D, eps, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    x1_ptr = x1_ptr + pid * D
+    x2_ptr = x2_ptr + pid * D
+    min_val = float("inf")
+    for start in range(0, D, BLOCK_SIZE):
+        cols = start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        a = tl.load(x1_ptr + cols, mask=mask, other=0)
+        b = tl.load(x2_ptr + cols, mask=mask, other=0)
+        diff = tl.abs(a - b + eps)
+        min_val = tl.minimum(min_val, tl.min(tl.where(mask, diff, float("inf"))))
+    tl.store(out_ptr + pid, min_val)
+
+
+@libentry()
 @triton.jit
 def pairwise_distance_p2_kernel_1(
     x1_ptr, x2_ptr, mid_ptr, D, eps, MID_SIZE, BLOCK_SIZE: tl.constexpr
@@ -225,10 +264,66 @@ def pairwise_distance_general_kernel_2(
 
     tl.store(out_ptr + pid, sum)
 
+@libentry()
+@triton.jit
+def pairwise_distance_max_kernel_1(
+    x1_ptr, x2_ptr, mid_ptr, D, eps, MID_SIZE, BLOCK_SIZE: tl.constexpr
+):
+    pid_n = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    offset = pid_d * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    base = pid_n * D
+    mask = offset < D
+    a = tl.load(x1_ptr + base + offset, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(x2_ptr + base + offset, mask=mask, other=0.0).to(tl.float32)
+    diff = tl.abs(a - b + eps)
+    mid = tl.max(tl.where(mask, diff, -float("inf")))
+    tl.store(mid_ptr + pid_n * MID_SIZE + pid_d, mid)
+
+@libentry()
+@triton.jit
+def pairwise_distance_max_kernel_2(
+    mid_ptr, out_ptr, MID_SIZE, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offset = tl.arange(0, BLOCK_SIZE)
+    mask = offset < MID_SIZE
+    mid = tl.load(mid_ptr + pid * MID_SIZE + offset, mask=mask, other=0.0)
+    max_val = tl.max(mid)
+
+    tl.store(out_ptr + pid, max_val)
+
+@libentry()
+@triton.jit
+def pairwise_distance_min_kernel_1(
+    x1_ptr, x2_ptr, mid_ptr, D, eps, MID_SIZE, BLOCK_SIZE: tl.constexpr
+):
+    pid_n = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    offset = pid_d * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    base = pid_n * D
+    mask = offset < D
+    a = tl.load(x1_ptr + base + offset, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(x2_ptr + base + offset, mask=mask, other=0.0).to(tl.float32)
+    diff = tl.abs(a - b + eps)
+    mid = tl.min(tl.where(mask, diff, float("inf")))
+    tl.store(mid_ptr + pid_n * MID_SIZE + pid_d, mid)
+
+@libentry()
+@triton.jit
+def pairwise_distance_min_kernel_2(
+    mid_ptr, out_ptr, MID_SIZE, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offset = tl.arange(0, BLOCK_SIZE)
+    mask = offset < MID_SIZE
+    mid = tl.load(mid_ptr + pid * MID_SIZE + offset, mask=mask, other=0.0)
+    max_val = tl.min(mid)
+
+    tl.store(out_ptr + pid, max_val)
+
 def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
     logger.debug("GEMS PAIRWISE_DISTANCE")
-    # 按需广播/连续化:同形+连续是常见情况,无条件 broadcast_tensors + contiguous 会
-    # 偷偷 materialize/copy,在小张量上吃掉 ~15us。只在真正需要时才做(参照 sum 的写法)。
     if x1.shape != x2.shape:
         x1, x2 = torch.broadcast_tensors(x1, x2)
     if not x1.is_contiguous():
@@ -242,9 +337,6 @@ def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
         out = out.unsqueeze(-1)
     grid = (N,)
     if p == 2.0:
-        # 分派:大 N(每行 1 个 program 已贴满带宽)或 小 D(split-K 没意义、MID 太小)
-        #       -> 单 kernel,省 split-K 的 mid 分配 + 二次 launch;
-        #   小 N + 大 D(单 kernel 只有 N 个 program 撑不满卡) -> split-K 拆 D 补并行。
         if N >= 1024 or D < 8192:
             pairwise_distance_p2_kernel[grid](x1, x2, out, D, eps)
         else:
@@ -274,6 +366,26 @@ def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
             mid = torch.empty((N, MID_SIZE), device=x1.device, dtype=torch.float32)
             pairwise_distance_p0_kernel_1[(N, MID_SIZE)](x1, x2, mid, D, eps, MID_SIZE, BLOCK_SIZE)
             pairwise_distance_p0_kernel_2[(N,)](mid, out, MID_SIZE, BLOCK_MID)
+    elif p == float("inf"):
+        if D < 8192:
+            pairwise_distance_max_kernel[grid](x1, x2, out, D, eps)
+        else:
+            BLOCK_SIZE = 1024
+            MID_SIZE = triton.cdiv(D, BLOCK_SIZE)
+            BLOCK_MID = triton.next_power_of_2(MID_SIZE)
+            mid = torch.empty((N, MID_SIZE), device=x1.device, dtype=torch.float32)
+            pairwise_distance_max_kernel_1[(N, MID_SIZE)](x1, x2, mid, D, eps, MID_SIZE, BLOCK_SIZE)
+            pairwise_distance_max_kernel_2[(N,)](mid, out, MID_SIZE, BLOCK_MID)
+    elif p == float("-inf"):
+        if D < 8192:
+            pairwise_distance_min_kernel[grid](x1, x2, out, D, eps)
+        else:
+            BLOCK_SIZE = 1024
+            MID_SIZE = triton.cdiv(D, BLOCK_SIZE)
+            BLOCK_MID = triton.next_power_of_2(MID_SIZE)
+            mid = torch.empty((N, MID_SIZE), device=x1.device, dtype=torch.float32)
+            pairwise_distance_min_kernel_1[(N, MID_SIZE)](x1, x2, mid, D, eps, MID_SIZE, BLOCK_SIZE)
+            pairwise_distance_min_kernel_2[(N,)](mid, out, MID_SIZE, BLOCK_MID)
     else:
         if N >= 1024 or D < 8192:
             pairwise_distance_general_kernel[grid](x1, x2, out, D, eps, p)

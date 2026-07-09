@@ -7,9 +7,8 @@ from . import accuracy_utils as utils
 from . import conftest as cfg
 
 # torch.nn.functional.pairwise_distance computes ||x1 - x2 + eps||_p and accepts
-# any real p. The gems kernel is expected to match that for arbitrary finite p.
-# (p = inf / -inf / 0 are also accepted by torch but require dedicated reduction
-# paths; they are not exercised here.)
+# any real p, including inf / -inf / 0. The gems kernel is expected to match torch
+# for all of these (inf -> max|diff|, -inf -> min|diff|, 0 -> nonzero count).
 if cfg.QUICK_MODE:
     FLOAT_DTYPES = [torch.float32]
     P_LIST = [2.0]
@@ -17,10 +16,6 @@ else:
     FLOAT_DTYPES = utils.FLOAT_DTYPES
     P_LIST = [-1.1, 0, 1.0, 1.5, 2.0, 4.3]
 
-# One distance per row -> M pairs of D-dim vectors. (1024, 257) uses a feature
-# dim that is not a multiple of the kernel BLOCK_SIZE (256) to exercise padding.
-# The op does not broadcast x2 against x1, so both inputs share the same shape;
-# only 1-D / 2-D inputs are supported by the kernel.
 SHAPES = [
     (7,),  # 1-D: a single pair of D-dim vectors -> scalar output
     (64, 64),
@@ -31,7 +26,7 @@ SHAPES = [
 
 @pytest.mark.pairwise_distance
 @pytest.mark.parametrize("shape", SHAPES)
-@pytest.mark.parametrize("p", P_LIST)
+@pytest.mark.parametrize("p", P_LIST + [float('inf'), float('-inf')])
 @pytest.mark.parametrize("keepdim", [False, True])
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_pairwise_distance_accuracy(shape, p, keepdim, dtype):
@@ -66,17 +61,18 @@ BROADCAST_SHAPES = [
 @pytest.mark.pairwise_distance
 @pytest.mark.parametrize("x1_shape, x2_shape", BROADCAST_SHAPES)
 @pytest.mark.parametrize("p", P_LIST)
+@pytest.mark.parametrize("keepdim", [False, True])
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
-def test_pairwise_distance_broadcast(x1_shape, x2_shape, p, dtype):
+def test_pairwise_distance_broadcast(x1_shape, x2_shape, p, keepdim, dtype):
     torch.manual_seed(0)
     x1 = torch.randn(x1_shape, dtype=dtype, device=flag_gems.device)
     x2 = torch.randn(x2_shape, dtype=dtype, device=flag_gems.device)
     ref_x1 = utils.to_reference(x1, True)
     ref_x2 = utils.to_reference(x2, True)
 
-    ref_out = torch.nn.functional.pairwise_distance(ref_x1, ref_x2, p=p, eps=1e-6)
+    ref_out = torch.nn.functional.pairwise_distance(ref_x1, ref_x2, p=p, eps=1e-6, keepdim=keepdim)
     with flag_gems.use_gems():
-        res_out = torch.nn.functional.pairwise_distance(x1, x2, p=p, eps=1e-6)
+        res_out = torch.nn.functional.pairwise_distance(x1, x2, p=p, eps=1e-6, keepdim=keepdim)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
 
