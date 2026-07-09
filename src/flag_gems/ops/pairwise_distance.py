@@ -18,7 +18,6 @@ PAIRWISE_DISTANCE_CONFIGS = [
     triton.Config({"BLOCK_SIZE": 1024}, num_warps=8),
     triton.Config({"BLOCK_SIZE": 2048}, num_warps=8),
     triton.Config({"BLOCK_SIZE": 4096}, num_warps=8),
-    triton.Config({"BLOCK_SIZE": 8192}, num_warps=8),
 ]
 
 @libentry()
@@ -322,6 +321,8 @@ def pairwise_distance_min_kernel_2(
 
     tl.store(out_ptr + pid, max_val)
 
+_SPLIT_K_BLOCK_MAX = 4096
+
 def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
     logger.debug("GEMS PAIRWISE_DISTANCE")
     if x1.shape != x2.shape:
@@ -336,62 +337,55 @@ def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
     if keepdim:
         out = out.unsqueeze(-1)
     grid = (N,)
+
+    BLOCK_SIZE = min(triton.next_power_of_2(D), _SPLIT_K_BLOCK_MAX)
+    MID_SIZE = triton.cdiv(D, BLOCK_SIZE)
+    use_split_k = MID_SIZE >= 2
+
     if p == 2.0:
-        if N >= 1024 or D < 8192:
+        if not use_split_k:
             pairwise_distance_p2_kernel[grid](x1, x2, out, D, eps)
         else:
-            BLOCK_SIZE = 1024
-            MID_SIZE = triton.cdiv(D, BLOCK_SIZE)
             BLOCK_MID = triton.next_power_of_2(MID_SIZE)
             mid = torch.empty((N, MID_SIZE), device=x1.device, dtype=torch.float32)
             pairwise_distance_p2_kernel_1[(N, MID_SIZE)](x1, x2, mid, D, eps, MID_SIZE, BLOCK_SIZE)
             pairwise_distance_p2_kernel_2[(N,)](mid, out, MID_SIZE, BLOCK_MID)
     elif p == 1.0:
-        if N >= 1024 or D < 8192:
+        if not use_split_k:
             pairwise_distance_p1_kernel[grid](x1, x2, out, D, eps)
         else:
-            BLOCK_SIZE = 1024
-            MID_SIZE = triton.cdiv(D, BLOCK_SIZE)
             BLOCK_MID = triton.next_power_of_2(MID_SIZE)
             mid = torch.empty((N, MID_SIZE), device=x1.device, dtype=torch.float32)
             pairwise_distance_p1_kernel_1[(N, MID_SIZE)](x1, x2, mid, D, eps, MID_SIZE, BLOCK_SIZE)
             pairwise_distance_p1_kernel_2[(N,)](mid, out, MID_SIZE, BLOCK_MID)
     elif p == 0.0:
-        if N >= 1024 or D < 8192:
+        if not use_split_k:
             pairwise_distance_p0_kernel[grid](x1, x2, out, D, eps)
         else:
-            BLOCK_SIZE = 1024
-            MID_SIZE = triton.cdiv(D, BLOCK_SIZE)
             BLOCK_MID = triton.next_power_of_2(MID_SIZE)
             mid = torch.empty((N, MID_SIZE), device=x1.device, dtype=torch.float32)
             pairwise_distance_p0_kernel_1[(N, MID_SIZE)](x1, x2, mid, D, eps, MID_SIZE, BLOCK_SIZE)
             pairwise_distance_p0_kernel_2[(N,)](mid, out, MID_SIZE, BLOCK_MID)
     elif p == float("inf"):
-        if D < 8192:
+        if not use_split_k:
             pairwise_distance_max_kernel[grid](x1, x2, out, D, eps)
         else:
-            BLOCK_SIZE = 1024
-            MID_SIZE = triton.cdiv(D, BLOCK_SIZE)
             BLOCK_MID = triton.next_power_of_2(MID_SIZE)
             mid = torch.empty((N, MID_SIZE), device=x1.device, dtype=torch.float32)
             pairwise_distance_max_kernel_1[(N, MID_SIZE)](x1, x2, mid, D, eps, MID_SIZE, BLOCK_SIZE)
             pairwise_distance_max_kernel_2[(N,)](mid, out, MID_SIZE, BLOCK_MID)
     elif p == float("-inf"):
-        if D < 8192:
+        if not use_split_k:
             pairwise_distance_min_kernel[grid](x1, x2, out, D, eps)
         else:
-            BLOCK_SIZE = 1024
-            MID_SIZE = triton.cdiv(D, BLOCK_SIZE)
             BLOCK_MID = triton.next_power_of_2(MID_SIZE)
             mid = torch.empty((N, MID_SIZE), device=x1.device, dtype=torch.float32)
             pairwise_distance_min_kernel_1[(N, MID_SIZE)](x1, x2, mid, D, eps, MID_SIZE, BLOCK_SIZE)
             pairwise_distance_min_kernel_2[(N,)](mid, out, MID_SIZE, BLOCK_MID)
     else:
-        if N >= 1024 or D < 8192:
+        if not use_split_k:
             pairwise_distance_general_kernel[grid](x1, x2, out, D, eps, p)
         else:
-            BLOCK_SIZE = 1024
-            MID_SIZE = triton.cdiv(D, BLOCK_SIZE)
             BLOCK_MID = triton.next_power_of_2(MID_SIZE)
             mid = torch.empty((N, MID_SIZE), device=x1.device, dtype=torch.float32)
             pairwise_distance_general_kernel_1[(N, MID_SIZE)](x1, x2, mid, D, eps, p, MID_SIZE, BLOCK_SIZE)
