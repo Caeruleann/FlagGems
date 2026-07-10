@@ -4,29 +4,14 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems import runtime
 from flag_gems.utils import libentry, libtuner, tl_extra_shim
 
 pow = tl_extra_shim.pow
 logger = logging.getLogger(__name__)
 
 
-PAIRWISE_DISTANCE_CONFIGS = [
-    triton.Config({"BLOCK_M": 16, "BLOCK_D": 1}, num_warps=4),
-    triton.Config({"BLOCK_M": 32, "BLOCK_D": 1}, num_warps=4),
-    triton.Config({"BLOCK_M": 16, "BLOCK_D": 2}, num_warps=4),
-    triton.Config({"BLOCK_M": 16, "BLOCK_D": 4}, num_warps=4),
-    triton.Config({"BLOCK_M": 16, "BLOCK_D": 8}, num_warps=4),
-    triton.Config({"BLOCK_M": 1, "BLOCK_D": 1024}, num_warps=8),
-    triton.Config({"BLOCK_M": 1, "BLOCK_D": 4096}, num_warps=8),
-    triton.Config({"BLOCK_M": 4, "BLOCK_D": 256}, num_warps=4),
-    triton.Config({"BLOCK_M": 4, "BLOCK_D": 1024}, num_warps=8),
-    triton.Config({"BLOCK_M": 8, "BLOCK_D": 128}, num_warps=4),
-    triton.Config({"BLOCK_M": 8, "BLOCK_D": 256}, num_warps=8),
-    triton.Config({"BLOCK_M": 8, "BLOCK_D": 1024}, num_warps=8),
-    triton.Config({"BLOCK_M": 16, "BLOCK_D": 64}, num_warps=4),
-    triton.Config({"BLOCK_M": 16, "BLOCK_D": 128}, num_warps=8),
-    triton.Config({"BLOCK_M": 16, "BLOCK_D": 256}, num_warps=8),
-]
+PAIRWISE_DISTANCE_CONFIGS = runtime.get_tuned_config("pairwise_distance")
 
 
 @libentry()
