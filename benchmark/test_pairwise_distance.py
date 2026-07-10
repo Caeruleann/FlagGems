@@ -17,7 +17,7 @@ def pairwise_distance_input_fn(shape, dtype, device):
         for p in (float("-inf"), float("inf"), 0.0, 1.0, 2.0, 6.6):
             yield inp1, inp2, {"p": p}
     else:
-        yield inp1, inp2 # default p=2.0
+        yield inp1, inp2  # default p=2.0
 
 
 class PairwiseDistanceBenchmark(base.GenericBenchmark2DOnly):
@@ -27,12 +27,7 @@ class PairwiseDistanceBenchmark(base.GenericBenchmark2DOnly):
         # case a 2-D / split-K grid targets). (1, D) is equivalent to a 1-D
         # single pair here (grid = 1 program).
         shapes = super().set_more_shapes()
-        shapes += [
-            (1, 65536),
-            (8, 65536),
-            (64, 65536),
-            (1, 10000000)
-        ]
+        shapes += [(1, 65536), (8, 65536), (64, 65536), (1, 10000000)]
         return shapes
 
 

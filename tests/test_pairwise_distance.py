@@ -20,13 +20,13 @@ SHAPES = [
     (7,),  # 1-D: a single pair of D-dim vectors -> scalar output
     (64, 64),
     (1024, 257),
-    (1, 10000000)
+    (1, 10000000),
 ]
 
 
 @pytest.mark.pairwise_distance
 @pytest.mark.parametrize("shape", SHAPES)
-@pytest.mark.parametrize("p", P_LIST + [float('inf'), float('-inf')])
+@pytest.mark.parametrize("p", P_LIST + [float("inf"), float("-inf")])
 @pytest.mark.parametrize("keepdim", [False, True])
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_pairwise_distance_accuracy(shape, p, keepdim, dtype):
@@ -70,9 +70,13 @@ def test_pairwise_distance_broadcast(x1_shape, x2_shape, p, keepdim, dtype):
     ref_x1 = utils.to_reference(x1, True)
     ref_x2 = utils.to_reference(x2, True)
 
-    ref_out = torch.nn.functional.pairwise_distance(ref_x1, ref_x2, p=p, eps=1e-6, keepdim=keepdim)
+    ref_out = torch.nn.functional.pairwise_distance(
+        ref_x1, ref_x2, p=p, eps=1e-6, keepdim=keepdim
+    )
     with flag_gems.use_gems():
-        res_out = torch.nn.functional.pairwise_distance(x1, x2, p=p, eps=1e-6, keepdim=keepdim)
+        res_out = torch.nn.functional.pairwise_distance(
+            x1, x2, p=p, eps=1e-6, keepdim=keepdim
+        )
 
     utils.gems_assert_close(res_out, ref_out, dtype)
 
