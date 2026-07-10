@@ -11,21 +11,21 @@ logger = logging.getLogger(__name__)
 
 
 PAIRWISE_DISTANCE_CONFIGS = [
-    triton.Config({"BLOCK_M": 1, "BLOCK_D": 256}, num_warps=4),
+    triton.Config({"BLOCK_M": 16, "BLOCK_D": 1}, num_warps=4),
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 1}, num_warps=4),
+    triton.Config({"BLOCK_M": 16, "BLOCK_D": 2}, num_warps=4),
+    triton.Config({"BLOCK_M": 16, "BLOCK_D": 4}, num_warps=4),
+    triton.Config({"BLOCK_M": 16, "BLOCK_D": 8}, num_warps=4),
     triton.Config({"BLOCK_M": 1, "BLOCK_D": 1024}, num_warps=8),
     triton.Config({"BLOCK_M": 1, "BLOCK_D": 4096}, num_warps=8),
-    triton.Config({"BLOCK_M": 2, "BLOCK_D": 256}, num_warps=4),
     triton.Config({"BLOCK_M": 4, "BLOCK_D": 256}, num_warps=4),
     triton.Config({"BLOCK_M": 4, "BLOCK_D": 1024}, num_warps=8),
-    triton.Config({"BLOCK_M": 4, "BLOCK_D": 4096}, num_warps=8),
     triton.Config({"BLOCK_M": 8, "BLOCK_D": 128}, num_warps=4),
     triton.Config({"BLOCK_M": 8, "BLOCK_D": 256}, num_warps=8),
     triton.Config({"BLOCK_M": 8, "BLOCK_D": 1024}, num_warps=8),
-    triton.Config({"BLOCK_M": 8, "BLOCK_D": 2048}, num_warps=8),
     triton.Config({"BLOCK_M": 16, "BLOCK_D": 64}, num_warps=4),
     triton.Config({"BLOCK_M": 16, "BLOCK_D": 128}, num_warps=8),
     triton.Config({"BLOCK_M": 16, "BLOCK_D": 256}, num_warps=8),
-    triton.Config({"BLOCK_M": 16, "BLOCK_D": 1024}, num_warps=8),
 ]
 
 
@@ -341,9 +341,6 @@ def pairwise_distance_min_kernel_2(
     tl.store(out_ptr + pid, max_val)
 
 
-_SPLIT_K_BLOCK_MAX = 4096
-
-
 def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
     logger.debug("GEMS PAIRWISE_DISTANCE")
     if x1.shape != x2.shape:
@@ -359,9 +356,9 @@ def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
         out = out.unsqueeze(-1)
     grid = lambda meta: (triton.cdiv(N, meta["BLOCK_M"]),)
 
-    BLOCK_SIZE = min(triton.next_power_of_2(D), _SPLIT_K_BLOCK_MAX)
+    BLOCK_SIZE = min(triton.next_power_of_2(D), 4096)
     MID_SIZE = triton.cdiv(D, BLOCK_SIZE)
-    use_split_k = MID_SIZE >= 2
+    use_split_k = (N <= 128) and (MID_SIZE >= 2)
 
     if p == 2.0:
         if not use_split_k:
