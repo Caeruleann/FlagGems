@@ -305,7 +305,7 @@ def pairwise_distance_max_kernel_2(
     offset = tl.arange(0, BLOCK_SIZE)
     mask = offset < MID_SIZE
     mid = tl.load(mid_ptr + pid * MID_SIZE + offset, mask=mask, other=0.0)
-    max_val = tl.max(mid)
+    max_val = tl.max(tl.where(mask, mid, -float("inf")))
 
     tl.store(out_ptr + pid, max_val)
 
@@ -336,9 +336,9 @@ def pairwise_distance_min_kernel_2(
     offset = tl.arange(0, BLOCK_SIZE)
     mask = offset < MID_SIZE
     mid = tl.load(mid_ptr + pid * MID_SIZE + offset, mask=mask, other=0.0)
-    max_val = tl.min(mid)
+    min_val = tl.min(tl.where(mask, mid, float("inf")))
 
-    tl.store(out_ptr + pid, max_val)
+    tl.store(out_ptr + pid, min_val)
 
 
 def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
