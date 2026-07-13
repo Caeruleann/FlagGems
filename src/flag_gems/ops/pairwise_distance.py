@@ -8,7 +8,9 @@ from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, libtuner, tl_extra_shim
 
-pow = tl_extra_shim.pow
+# x ** p is decomposed as exp2(p * log2(x)): tl_extra_shim.pow is too heavy
+exp2 = tl_extra_shim.exp2
+log2 = tl_extra_shim.log2
 logger = logging.getLogger(__name__)
 
 
@@ -17,7 +19,7 @@ PAIRWISE_DISTANCE_CONFIGS = runtime.get_tuned_config("pairwise_distance")
 
 @libentry()
 @libtuner(configs=PAIRWISE_DISTANCE_CONFIGS, key=["D"])
-@triton.jit(do_not_specialize=["eps", "p"])
+@triton.jit
 def pairwise_distance_general_kernel(
     x1_ptr, x2_ptr, out_ptr, N, D, eps, p, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr
 ):
@@ -31,14 +33,14 @@ def pairwise_distance_general_kernel(
         a = tl.load(x1_ptr + pid * D + cols, mask=mask, other=0).to(tl.float32)
         b = tl.load(x2_ptr + pid * D + cols, mask=mask, other=0).to(tl.float32)
         diff = tl.abs(a - b + eps)
-        acc += tl.sum(tl.where(mask, pow(diff, p), 0.0), axis=1)
-    dist = pow(acc, 1.0 / p)
+        acc += tl.sum(tl.where(mask, exp2(p * log2(diff)), 0.0), axis=1)
+    dist = exp2((1.0 / p) * log2(acc))
     tl.store(out_ptr + pid, dist[:, None], row_mask)
 
 
 @libentry()
 @libtuner(configs=PAIRWISE_DISTANCE_CONFIGS, key=["D"])
-@triton.jit(do_not_specialize=["eps"])
+@triton.jit
 def pairwise_distance_p2_kernel(
     x1_ptr, x2_ptr, out_ptr, N, D, eps, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr
 ):
@@ -60,7 +62,7 @@ def pairwise_distance_p2_kernel(
 
 @libentry()
 @libtuner(configs=PAIRWISE_DISTANCE_CONFIGS, key=["D"])
-@triton.jit(do_not_specialize=["eps"])
+@triton.jit
 def pairwise_distance_p1_kernel(
     x1_ptr, x2_ptr, out_ptr, N, D, eps, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr
 ):
@@ -81,7 +83,7 @@ def pairwise_distance_p1_kernel(
 
 @libentry()
 @libtuner(configs=PAIRWISE_DISTANCE_CONFIGS, key=["D"])
-@triton.jit(do_not_specialize=["eps"])
+@triton.jit
 def pairwise_distance_p0_kernel(
     x1_ptr, x2_ptr, out_ptr, N, D, eps, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr
 ):
@@ -102,7 +104,7 @@ def pairwise_distance_p0_kernel(
 
 @libentry()
 @libtuner(configs=PAIRWISE_DISTANCE_CONFIGS, key=["D"])
-@triton.jit(do_not_specialize=["eps"])
+@triton.jit
 def pairwise_distance_max_kernel(
     x1_ptr, x2_ptr, out_ptr, N, D, eps, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr
 ):
@@ -124,7 +126,7 @@ def pairwise_distance_max_kernel(
 
 @libentry()
 @libtuner(configs=PAIRWISE_DISTANCE_CONFIGS, key=["D"])
-@triton.jit(do_not_specialize=["eps"])
+@triton.jit
 def pairwise_distance_min_kernel(
     x1_ptr, x2_ptr, out_ptr, N, D, eps, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr
 ):
@@ -145,7 +147,7 @@ def pairwise_distance_min_kernel(
 
 
 @libentry()
-@triton.jit(do_not_specialize=["eps"])
+@triton.jit
 def pairwise_distance_p2_kernel_1(
     x1_ptr, x2_ptr, mid_ptr, D, eps, MID_SIZE, BLOCK_SIZE: tl.constexpr
 ):
@@ -174,7 +176,7 @@ def pairwise_distance_p2_kernel_2(mid_ptr, out_ptr, MID_SIZE, BLOCK_SIZE: tl.con
 
 
 @libentry()
-@triton.jit(do_not_specialize=["eps"])
+@triton.jit
 def pairwise_distance_p1_kernel_1(
     x1_ptr, x2_ptr, mid_ptr, D, eps, MID_SIZE, BLOCK_SIZE: tl.constexpr
 ):
@@ -203,7 +205,7 @@ def pairwise_distance_p1_kernel_2(mid_ptr, out_ptr, MID_SIZE, BLOCK_SIZE: tl.con
 
 
 @libentry()
-@triton.jit(do_not_specialize=["eps"])
+@triton.jit
 def pairwise_distance_p0_kernel_1(
     x1_ptr, x2_ptr, mid_ptr, D, eps, MID_SIZE, BLOCK_SIZE: tl.constexpr
 ):
@@ -232,7 +234,7 @@ def pairwise_distance_p0_kernel_2(mid_ptr, out_ptr, MID_SIZE, BLOCK_SIZE: tl.con
 
 
 @libentry()
-@triton.jit(do_not_specialize=["eps", "p"])
+@triton.jit
 def pairwise_distance_general_kernel_1(
     x1_ptr, x2_ptr, mid_ptr, D, eps, p, MID_SIZE, BLOCK_SIZE: tl.constexpr
 ):
@@ -244,12 +246,12 @@ def pairwise_distance_general_kernel_1(
     a = tl.load(x1_ptr + base + offset, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(x2_ptr + base + offset, mask=mask, other=0.0).to(tl.float32)
     diff = tl.abs(a - b + eps)
-    mid = tl.sum(tl.where(mask, pow(diff, p), 0.0))
+    mid = tl.sum(tl.where(mask, exp2(p * log2(diff)), 0.0))
     tl.store(mid_ptr + pid_n * MID_SIZE + pid_d, mid)
 
 
 @libentry()
-@triton.jit(do_not_specialize=["p"])
+@triton.jit
 def pairwise_distance_general_kernel_2(
     mid_ptr, out_ptr, p, MID_SIZE, BLOCK_SIZE: tl.constexpr
 ):
@@ -257,13 +259,13 @@ def pairwise_distance_general_kernel_2(
     offset = tl.arange(0, BLOCK_SIZE)
     mask = offset < MID_SIZE
     mid = tl.load(mid_ptr + pid * MID_SIZE + offset, mask=mask, other=0.0)
-    sum = pow(tl.sum(mid), 1 / p)
+    sum = exp2((1 / p) * log2(tl.sum(mid)))
 
     tl.store(out_ptr + pid, sum)
 
 
 @libentry()
-@triton.jit(do_not_specialize=["eps"])
+@triton.jit
 def pairwise_distance_max_kernel_1(
     x1_ptr, x2_ptr, mid_ptr, D, eps, MID_SIZE, BLOCK_SIZE: tl.constexpr
 ):
@@ -294,7 +296,7 @@ def pairwise_distance_max_kernel_2(
 
 
 @libentry()
-@triton.jit(do_not_specialize=["eps"])
+@triton.jit
 def pairwise_distance_min_kernel_1(
     x1_ptr, x2_ptr, mid_ptr, D, eps, MID_SIZE, BLOCK_SIZE: tl.constexpr
 ):
