@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from . import base, consts, utils
+import flag_gems
 
 
 def composed_pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
@@ -70,6 +71,7 @@ def test_pairwise_distance():
         op_name="pairwise_distance",
         input_fn=pairwise_distance_input_fn,
         torch_op=safe_pairwise_distance,
+        gems_op = flag_gems.pairwise_distance,
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()
