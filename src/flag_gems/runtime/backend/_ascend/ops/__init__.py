@@ -68,6 +68,7 @@ from .multinomial import multinomial
 from .ones import ones
 from .ones_like import ones_like
 from .outer import outer
+from .pairwise_distance import pairwise_distance
 from .polar import polar
 from .pow import (
     pow_scalar,
@@ -175,6 +176,7 @@ __all__ = [
     "ones",
     "ones_like",
     "outer",
+    "pairwise_distance",
     "polar",
     "pow_scalar",
     "pow_tensor_scalar",
