@@ -6,6 +6,39 @@ import flag_gems
 from . import accuracy_utils as utils
 from . import conftest as cfg
 
+
+def composed_pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
+    """NPU-native pairwise_distance via basic torch ops (sub+abs+pow+sum).
+    Supports arbitrary p, unlike torch_npu's LpNormV2 which only accepts {0,1,2}.
+    Used as the reference when aten would crash on p not in {0,1,2,inf,-inf}."""
+    diff = torch.abs(x1 - x2 + eps)
+    if p == float("inf"):
+        return torch.amax(diff, dim=-1, keepdim=keepdim)
+    elif p == float("-inf"):
+        return torch.amin(diff, dim=-1, keepdim=keepdim)
+    elif p == 0.0:
+        return torch.sum(diff != 0, dim=-1, keepdim=keepdim, dtype=torch.float32).to(
+            x1.dtype
+        )
+    else:
+        return torch.pow(
+            torch.sum(torch.pow(diff, p), dim=-1, keepdim=keepdim), 1.0 / p
+        ).to(x1.dtype)
+
+
+# torch_npu's native pairwise_distance only supports p in {0, 1, 2} -- inf,
+# -inf, and arbitrary real p all crash (core dump). When the reference runs on
+# NPU (not CPU), use the composed version for any p outside {0, 1, 2}.
+_ATEN_SUPPORTED_P = (0.0, 1.0, 2.0)
+
+
+def _ref_pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
+    if not cfg.TO_CPU and p not in _ATEN_SUPPORTED_P:
+        return composed_pairwise_distance(x1, x2, p=p, eps=eps, keepdim=keepdim)
+    return torch.nn.functional.pairwise_distance(
+        x1, x2, p=p, eps=eps, keepdim=keepdim
+    )
+
 # torch.nn.functional.pairwise_distance computes ||x1 - x2 + eps||_p and accepts
 # any real p, including inf / -inf / 0. The gems kernel is expected to match torch
 # for all of these (inf -> max|diff|, -inf -> min|diff|, 0 -> nonzero count).
@@ -40,7 +73,7 @@ def test_pairwise_distance_accuracy(shape, p, keepdim, dtype):
     ref_x1 = utils.to_reference(x1, True)
     ref_x2 = utils.to_reference(x2, True)
 
-    ref_out = torch.nn.functional.pairwise_distance(
+    ref_out = _ref_pairwise_distance(
         ref_x1, ref_x2, p=p, eps=1e-6, keepdim=keepdim
     )
     with flag_gems.use_gems():
@@ -74,7 +107,7 @@ def test_pairwise_distance_broadcast(x1_shape, x2_shape, p, keepdim, dtype):
     ref_x1 = utils.to_reference(x1, True)
     ref_x2 = utils.to_reference(x2, True)
 
-    ref_out = torch.nn.functional.pairwise_distance(
+    ref_out = _ref_pairwise_distance(
         ref_x1, ref_x2, p=p, eps=1e-6, keepdim=keepdim
     )
     with flag_gems.use_gems():
@@ -107,7 +140,7 @@ def test_pairwise_distance_ndim3plus(shape, p, keepdim, dtype):
     ref_x1 = utils.to_reference(x1, True)
     ref_x2 = utils.to_reference(x2, True)
 
-    ref_out = torch.nn.functional.pairwise_distance(
+    ref_out = _ref_pairwise_distance(
         ref_x1, ref_x2, p=p, eps=1e-6, keepdim=keepdim
     )
     with flag_gems.use_gems():
@@ -142,7 +175,7 @@ def test_pairwise_distance_broadcast_ndim3plus(x1_shape, x2_shape, p, keepdim, d
     ref_x1 = utils.to_reference(x1, True)
     ref_x2 = utils.to_reference(x2, True)
 
-    ref_out = torch.nn.functional.pairwise_distance(
+    ref_out = _ref_pairwise_distance(
         ref_x1, ref_x2, p=p, eps=1e-6, keepdim=keepdim
     )
     with flag_gems.use_gems():
