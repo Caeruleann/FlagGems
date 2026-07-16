@@ -133,6 +133,13 @@ PYBIND11_MODULE(c_operators, m) {
   m.def("sort_stable", &flag_gems::sort_stable);
   m.def("softmax", &flag_gems::softmax);
   m.def("softmax_backward", &flag_gems::softmax_backward);
+  m.def("pairwise_distance",
+        &flag_gems::pairwise_distance,
+        py::arg("x1"),
+        py::arg("x2"),
+        py::arg("p") = 2.0,
+        py::arg("eps") = 1e-6,
+        py::arg("keepdim") = false);
   m.def("reshape_and_cache_flash", &flag_gems::reshape_and_cache_flash);
   m.def("flash_attn_varlen_func", &flag_gems::flash_attn_varlen_func);
   m.def("rwkv_mm_sparsity", &flag_gems::rwkv_mm_sparsity);
