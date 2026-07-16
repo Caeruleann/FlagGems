@@ -225,6 +225,33 @@ def mm_heur_even_k(args):
     return args["K"] % (args["BLOCK_K"] * args["SPLIT_K"]) == 0
 
 
+# --- pairwise_distance (acnnl cdist/lp_norm_v2-informed tiling) ---
+# Reduction is over the last dim D, one independent distance per row (N rows).
+# BLOCK_D grows with D so each load is a large contiguous MTE2 transaction (the key
+# to ~850 GB/s, msprof-verified): a whole row when D is small/medium, the largest
+# UB-fit chunk when D is large. Mirrors acnnl cdist's ubFactorR.
+def pairwise_distance_heur_block_d(args):
+    D = args["D"]
+    return min(triton.next_power_of_2(D), 8192)
+
+
+# BLOCK_M then spends whatever UB headroom BLOCK_D leaves. Per-tile budget is
+# ~ BLOCK_M*BLOCK_D*16B (int32 offsets + a + b + diff, fp32 working set) <= ~150KB,
+# i.e. BLOCK_M*BLOCK_D <= 8192 elems (conservative for fp16/bf16 upcast too).
+# Mirrors acnnl cdist's ubFactorA (MAX_INNER_A).
+def pairwise_distance_heur_block_m(args):
+    bd = pairwise_distance_heur_block_d(args)
+    return max(1, min(32, 8192 // bd))
+
+
+# Split-K chunk for the large-D 2-kernel path. min(next_pow2(D), 8192) gives the
+# largest-fit chunk without masked waste (acnnl cdist BLOCK_SIZE; do_bench sweep
+# picked the largest over {1024,2048,4096,8192}, 1.5-2.4x over 1024).
+def pairwise_distance_heur_split_block(args):
+    D = args["D"]
+    return min(triton.next_power_of_2(D), 8192)
+
+
 HEURISTICS_CONFIGS = {
     "argmax": {
         "BLOCK_M": argmax_heur_block_m,
@@ -313,5 +340,10 @@ HEURISTICS_CONFIGS = {
         "BLOCK_N": lambda args: 16,  # 64
         "num_warps": lambda args: 4,  # 4
         "num_stages": lambda args: 3,  # 3
+    },
+    "pairwise_distance": {
+        "BLOCK_M": pairwise_distance_heur_block_m,
+        "BLOCK_D": pairwise_distance_heur_block_d,
+        "BLOCK_SIZE": pairwise_distance_heur_split_block,
     },
 }
