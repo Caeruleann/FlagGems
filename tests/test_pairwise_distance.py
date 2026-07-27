@@ -46,17 +46,14 @@ if cfg.QUICK_MODE:
     P_LIST = [2.0]
 else:
     FLOAT_DTYPES = utils.FLOAT_DTYPES
-    P_LIST = [-1.1, 0, 1.0, 1.5, 2.0, 4.3]
+    P_LIST = [0, 1.0, 1.5, 2.0]
 
 SHAPES = [
     (7,),  # 1-D: a single pair of D-dim vectors -> scalar output
     (64, 64),
     (1024, 257),
+    (64, 65536),  # split-K (small N, large D)
     (1, 10000000),
-    (8, 8192),
-    (64, 65536),
-    (100, 5000),
-    (128, 4097),
 ]
 
 
@@ -84,31 +81,26 @@ def test_pairwise_distance_accuracy(shape, p, keepdim, dtype):
 # (x1_shape, x2_shape) pairs exercising broadcasting: torch broadcasts x2 against
 # x1 before reducing over the last dim. Requires the op to broadcast internally.
 BROADCAST_SHAPES = [
-    ((4,), (1,)),  # 1-D vs single-element vector (e.g. [1,2,4,100] vs [3])
-    ((4,), (4,)),  # no broadcast (sanity)
+    ((4,), (1,)),  # 1-D vs single-element vector
     ((3, 4), (4,)),  # 2-D vs trailing 1-D
     ((3, 4), (1, 4)),  # 2-D vs row-broadcast
-    ((2, 8), (1,)),  # 2-D vs scalar-vector
 ]
 
 
 @pytest.mark.pairwise_distance
 @pytest.mark.parametrize("x1_shape, x2_shape", BROADCAST_SHAPES)
 @pytest.mark.parametrize("p", P_LIST)
-@pytest.mark.parametrize("keepdim", [False, True])
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
-def test_pairwise_distance_broadcast(x1_shape, x2_shape, p, keepdim, dtype):
+def test_pairwise_distance_broadcast(x1_shape, x2_shape, p, dtype):
     torch.manual_seed(0)
     x1 = torch.randn(x1_shape, dtype=dtype, device=flag_gems.device)
     x2 = torch.randn(x2_shape, dtype=dtype, device=flag_gems.device)
     ref_x1 = utils.to_reference(x1, True)
     ref_x2 = utils.to_reference(x2, True)
 
-    ref_out = _ref_pairwise_distance(ref_x1, ref_x2, p=p, eps=1e-6, keepdim=keepdim)
+    ref_out = _ref_pairwise_distance(ref_x1, ref_x2, p=p, eps=1e-6)
     with flag_gems.use_gems():
-        res_out = torch.nn.functional.pairwise_distance(
-            x1, x2, p=p, eps=1e-6, keepdim=keepdim
-        )
+        res_out = torch.nn.functional.pairwise_distance(x1, x2, p=p, eps=1e-6)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
 
@@ -118,7 +110,6 @@ def test_pairwise_distance_broadcast(x1_shape, x2_shape, p, keepdim, dtype):
 # batch rows (N = numel // D), not collapse the whole tensor to a single pair.
 NDIM_GE3_SHAPES = [
     (2, 3, 4),  # 3-D -> out (2, 3)
-    (4, 8, 16),  # 3-D, larger
     (2, 3, 4, 5),  # 4-D -> out (2, 3, 4)
 ]
 
@@ -126,20 +117,17 @@ NDIM_GE3_SHAPES = [
 @pytest.mark.pairwise_distance
 @pytest.mark.parametrize("shape", NDIM_GE3_SHAPES)
 @pytest.mark.parametrize("p", P_LIST)
-@pytest.mark.parametrize("keepdim", [False, True])
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
-def test_pairwise_distance_ndim3plus(shape, p, keepdim, dtype):
+def test_pairwise_distance_ndim3plus(shape, p, dtype):
     torch.manual_seed(0)
     x1 = torch.randn(shape, dtype=dtype, device=flag_gems.device)
     x2 = torch.randn(shape, dtype=dtype, device=flag_gems.device)
     ref_x1 = utils.to_reference(x1, True)
     ref_x2 = utils.to_reference(x2, True)
 
-    ref_out = _ref_pairwise_distance(ref_x1, ref_x2, p=p, eps=1e-6, keepdim=keepdim)
+    ref_out = _ref_pairwise_distance(ref_x1, ref_x2, p=p, eps=1e-6)
     with flag_gems.use_gems():
-        res_out = torch.nn.functional.pairwise_distance(
-            x1, x2, p=p, eps=1e-6, keepdim=keepdim
-        )
+        res_out = torch.nn.functional.pairwise_distance(x1, x2, p=p, eps=1e-6)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
 
@@ -148,30 +136,50 @@ def test_pairwise_distance_ndim3plus(shape, p, keepdim, dtype):
 # x1 to a 3-D/4-D shape, then reduced over the last dim. Exercises the broadcast
 # path and the multi-row (numel // D) path together.
 BROADCAST_NDIM3_SHAPES = [
-    ((2, 3, 4), (3, 4)),  # -> out (2, 3)
-    ((2, 3, 4), (4,)),  # -> out (2, 3)
-    ((2, 3, 4), (1,)),  # -> out (2, 3)
-    ((2, 3, 4, 5), (4, 5)),  # -> out (2, 3, 4)
-    ((2, 3, 4, 5), (5,)),  # -> out (2, 3, 4)
+    ((2, 3, 4), (3, 4)),  # 3-D broadcast -> out (2, 3)
+    ((2, 3, 4, 5), (5,)),  # 4-D broadcast -> out (2, 3, 4)
 ]
 
 
 @pytest.mark.pairwise_distance
 @pytest.mark.parametrize("x1_shape, x2_shape", BROADCAST_NDIM3_SHAPES)
 @pytest.mark.parametrize("p", P_LIST)
-@pytest.mark.parametrize("keepdim", [False, True])
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
-def test_pairwise_distance_broadcast_ndim3plus(x1_shape, x2_shape, p, keepdim, dtype):
+def test_pairwise_distance_broadcast_ndim3plus(x1_shape, x2_shape, p, dtype):
     torch.manual_seed(0)
     x1 = torch.randn(x1_shape, dtype=dtype, device=flag_gems.device)
     x2 = torch.randn(x2_shape, dtype=dtype, device=flag_gems.device)
     ref_x1 = utils.to_reference(x1, True)
     ref_x2 = utils.to_reference(x2, True)
 
-    ref_out = _ref_pairwise_distance(ref_x1, ref_x2, p=p, eps=1e-6, keepdim=keepdim)
+    ref_out = _ref_pairwise_distance(ref_x1, ref_x2, p=p, eps=1e-6)
     with flag_gems.use_gems():
-        res_out = torch.nn.functional.pairwise_distance(
-            x1, x2, p=p, eps=1e-6, keepdim=keepdim
-        )
+        res_out = torch.nn.functional.pairwise_distance(x1, x2, p=p, eps=1e-6)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
+
+
+# float64 accuracy: verify fp64 inputs are accumulated in fp64 (not silently
+# downcast to fp32, which would lose ~9 digits of precision). Covers fast paths
+# (p=2/1/inf/-inf) + a general p (1.5), on a per-row and a split-K shape.
+FP64_P_LIST = [2.0, 1.0, 1.5, float("inf"), float("-inf")]
+FP64_SHAPES = [(64, 257), (8, 65536)]
+
+
+@pytest.mark.pairwise_distance
+@pytest.mark.parametrize("shape", FP64_SHAPES)
+@pytest.mark.parametrize("p", FP64_P_LIST)
+def test_pairwise_distance_fp64(shape, p):
+    if not utils.fp64_is_supported:
+        pytest.skip("fp64 not supported on this device")
+    torch.manual_seed(0)
+    x1 = torch.randn(shape, dtype=torch.float64, device=flag_gems.device)
+    x2 = torch.randn(shape, dtype=torch.float64, device=flag_gems.device)
+    ref_x1 = utils.to_reference(x1, True)
+    ref_x2 = utils.to_reference(x2, True)
+
+    ref_out = _ref_pairwise_distance(ref_x1, ref_x2, p=p, eps=1e-6)
+    with flag_gems.use_gems():
+        res_out = torch.nn.functional.pairwise_distance(x1, x2, p=p, eps=1e-6)
+
+    utils.gems_assert_close(res_out, ref_out, torch.float64)

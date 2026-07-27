@@ -30,12 +30,8 @@ def pairwise_distance_input_fn(shape, dtype, device):
     inp1 = utils.generate_tensor_input(shape, dtype, device)
     inp2 = utils.generate_tensor_input(shape, dtype, device)
 
-    if base.Config.bench_level == consts.BenchLevel.COMPREHENSIVE:
-        # Arbitrary real p is supported; sweep several p values plus eps.
-        for p in (float("-inf"), float("inf"), 0.0, 1.0, 2.0, 6.6):
-            yield inp1, inp2, {"p": p}
-    else:
-        yield inp1, inp2  # default p=2.0
+    for p in (float("-inf"), float("inf"), 0.0, 1.0, 2.0, 6.6):
+        yield inp1, inp2, {"p": p}
 
 
 class PairwiseDistanceBenchmark(base.GenericBenchmark2DOnly):
