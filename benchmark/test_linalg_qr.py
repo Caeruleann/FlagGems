@@ -25,48 +25,66 @@ def _gems_qr_out(A, out=None, mode="reduced"):
     Q, R = out
     return flag_gems.linalg_qr_out(A, mode, Q=Q, R=R)
 
-# Representative shapes covering all routing paths:
-#   fused (small square / tall / wide), blocked (large square), TSQR (tall-skinny).
-# Wide shapes (m < n) are included since they exercise a different Q/R layout.
-QR_SHAPES = [
-    # square: tiny → large
-    (8, 8),
-    (64, 64),
-    (256, 256),
-    (512, 512),
-    (1024, 1024),
-    (4096, 4096),
-    # tall (m > n): fused, routing-win, TSQR
-    (128, 32),
-    (512, 64),
-    (4096, 4),
-    (8192, 8),
-    # wide (m < n)
-    (8, 32),
-    (16, 64),
-    (32, 128),
-    (64, 256),
-    # batched
-    (64, 8, 8),
-    (128, 32, 32),
-    (32, 128, 128),
-    (4, 1024, 1024),
-]
+
+# All three torch.linalg.qr modes are benchmarked (the accuracy tests cover
+# the same set): reduced (default), complete (requires m >= n), r (R only).
+# Shapes come from the linalg_qr / linalg_qr_out entries in core_shapes.yaml.
+QR_MODES = ["reduced", "complete", "r"]
 
 
-class QRBenchmark(base.Benchmark):
-    def set_shapes(self, shape_file_path=None):
-        self.shapes = QR_SHAPES
+def _qr_out_shapes(shape, mode):
+    """Output (Q, R) shapes of torch.linalg.qr's out= variant per mode."""
+    *batch, m, n = shape
+    k = min(m, n)
+    if mode == "complete":
+        return (*batch, m, m), (*batch, m, n)
+    if mode == "r":
+        return (0,), (*batch, k, n)
+    return (*batch, m, k), (*batch, k, n)
 
-    def get_input_iter(self, cur_dtype):
-        for shape in self.shapes:
-            yield (torch.randn(shape, dtype=cur_dtype, device=self.device),)
+
+def _make_qr_input_fn(mode):
+    def input_fn(shape, dtype, device):
+        shape = tuple(shape)
+        if mode == "complete" and shape[-2] < shape[-1]:
+            return  # complete mode requires m >= n
+        yield torch.randn(shape, dtype=dtype, device=device), {"mode": mode}
+
+    return input_fn
+
+
+def _make_qr_out_input_fn(mode):
+    def input_fn(shape, dtype, device):
+        shape = tuple(shape)
+        if mode == "complete" and shape[-2] < shape[-1]:
+            return  # complete mode requires m >= n
+        A = torch.randn(shape, dtype=dtype, device=device)
+        Qshape, Rshape = _qr_out_shapes(shape, mode)
+        Q = torch.empty(Qshape, dtype=dtype, device=device)
+        R = torch.empty(Rshape, dtype=dtype, device=device)
+        yield A, {"out": (Q, R), "mode": mode}
+
+    return input_fn
+
+
+class QRGenericBenchmark(base.GenericBenchmark):
+    """GenericBenchmark for linalg_qr with shapes from core_shapes.yaml only.
+
+    The base class merges generic 1D/2D/3D extra shapes (e.g. (2**28,)) that
+    are not valid QR inputs (A must have at least 2 dimensions), so the
+    generic extras are disabled here.
+    """
+
+    def set_more_shapes(self):
+        return []
 
 
 @pytest.mark.linalg_qr
-def test_linalg_qr():
-    bench = QRBenchmark(
+@pytest.mark.parametrize("mode", QR_MODES)
+def test_linalg_qr(mode):
+    bench = QRGenericBenchmark(
         op_name="linalg_qr",
+        input_fn=_make_qr_input_fn(mode),
         torch_op=torch.ops.aten.linalg_qr,
         gems_op=flag_gems.linalg_qr,
         dtypes=[torch.float32, torch.float64],
@@ -74,24 +92,12 @@ def test_linalg_qr():
     bench.run()
 
 
-class QROutBenchmark(base.Benchmark):
-    def set_shapes(self, shape_file_path=None):
-        self.shapes = QR_SHAPES
-
-    def get_input_iter(self, cur_dtype):
-        for shape in self.shapes:
-            A = torch.randn(shape, dtype=cur_dtype, device=self.device)
-            *batch, m, n = shape
-            k = min(m, n)
-            Q = torch.empty(*batch, m, k, dtype=cur_dtype, device=self.device)
-            R = torch.empty(*batch, k, n, dtype=cur_dtype, device=self.device)
-            yield (A, {"out": (Q, R)})
-
-
 @pytest.mark.linalg_qr_out
-def test_linalg_qr_out():
-    bench = QROutBenchmark(
+@pytest.mark.parametrize("mode", QR_MODES)
+def test_linalg_qr_out(mode):
+    bench = QRGenericBenchmark(
         op_name="linalg_qr_out",
+        input_fn=_make_qr_out_input_fn(mode),
         torch_op=torch.linalg.qr,
         gems_op=_gems_qr_out,
         dtypes=[torch.float32, torch.float64],

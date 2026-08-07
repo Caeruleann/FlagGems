@@ -985,9 +985,12 @@ def _triu_copy_kernel(W, ROUT, rm, n, sWb, sWm, sWn, sRb, sRm, sRn, BLOCK: tl.co
 # ===========================================================================
 @libentry()
 @triton.jit
-def _identity_kernel(Q, m, qcols, sQb, sQm, sQn, BLOCK: tl.constexpr):
-    pid_b = tle.program_id(0)
-    pid_e = tle.program_id(1)
+def _identity_kernel(Q, m, qcols, grid_e, sQb, sQm, sQn, BLOCK: tl.constexpr):
+    # 1D grid (B * grid_e): a 2D (B, grid_e) grid would exceed CUDA's 65535
+    # gridY limit for large complete-mode Q (e.g. 8192x8192 -> grid_e = 65536).
+    pid = tle.program_id(0)
+    pid_b = pid // grid_e
+    pid_e = pid % grid_e
     numel = m * qcols
     offs = pid_e * BLOCK + tl.arange(0, BLOCK)
     mmask = offs < numel
@@ -1266,7 +1269,8 @@ def _assemble_q(V, tau, Tbuf, m, n, k, qcols, ib, B, out):
         # fp64: identity + per-panel larfb (static ib, fast solve path)
         sQb, sQm, sQn = out.stride()
         grid_e = (m * qcols + 1023) // 1024
-        _identity_kernel[(B, grid_e)](out, m, qcols, sQb, sQm, sQn, BLOCK=1024)
+        _identity_kernel[(B * grid_e,)](out, m, qcols, grid_e, sQb, sQm, sQn,
+                                        BLOCK=1024)
         for p in reversed(range(0, k, ib)):
             kk = p
             ib_active = min(ib, k - kk)
