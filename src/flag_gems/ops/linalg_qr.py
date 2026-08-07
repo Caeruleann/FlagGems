@@ -900,7 +900,7 @@ def _larfb_kernel(
 def _assemble_q_fused_kernel(
     V, TAU, Tbuf, Q, m, n, k, qcols, ib, P,
     sVb, sVm, sVn, sTauB, sTauN, sTb, sTm, sTn, sQb, sQm, sQn,
-    RM: tl.constexpr, IBN: tl.constexpr, TN: tl.constexpr, SOLVE: tl.constexpr,
+    RM: tl.constexpr, IBN: tl.constexpr, TN: tl.constexpr,
 ):
     pid_b = tle.program_id(0)
     pid_p = tle.program_id(1)
@@ -948,22 +948,8 @@ def _assemble_q_fused_kernel(
             Tb + (kk + col_idx)[:, None] * sTm + (kk + col_idx)[None, :] * sTn,
             mask=(col_idx[:, None] < iba) & (col_idx[None, :] < iba), other=zero,
         )
-        Y = tl.zeros((IBN, TN), dtype=dt)
-        if SOLVE:
-            # fp64: Tbuf holds M = T^{-1} -> solve M Y = W1 by back-substitution
-            for jj in tl.static_range(0, IBN):
-                i = IBN - 1 - jj
-                if i < iba:
-                    Mrow = tl.sum(tl.where(col_idx[:, None] == i, Tt, zero), axis=0)
-                    W1row = tl.sum(tl.where(col_idx[:, None] == i, W1, zero), axis=0)
-                    Mii = tl.sum(tl.where(col_idx == i, Mrow, zero))
-                    contrib = tl.sum(
-                        tl.where(col_idx[:, None] > i, Mrow[:, None] * Y, zero), axis=0
-                    )
-                    Yrow = (W1row - contrib) / Mii
-                    Y = tl.where(col_idx[:, None] == i, Yrow[None, :], Y)
-        else:
-            Y = tl.dot(Tt, W1, allow_tf32=False)
+        # fp32 only: Tbuf holds T -> Y = T @ W1 (one GEMM)
+        Y = tl.dot(Tt, W1, allow_tf32=False)
         Y = tl.where(col_idx[:, None] < iba, Y, zero)
         # Q[kk:m, p-tile] -= V_p Y
         for t in range(num_tiles):
@@ -992,6 +978,22 @@ def _triu_copy_kernel(W, ROUT, rm, n, sWb, sWm, sWn, sRb, sRm, sRn, BLOCK: tl.co
     j = offs % n
     val = tl.load(W + pid_b * sWb + i * sWm + j * sWn, mask=mmask, other=0.0)
     tl.store(ROUT + pid_b * sRb + i * sRm + j * sRn, tl.where(i <= j, val, 0.0), mask=mmask)
+
+
+# ===========================================================================
+# Kernel 5: write an identity matrix into Q (m x qcols)
+# ===========================================================================
+@libentry()
+@triton.jit
+def _identity_kernel(Q, m, qcols, sQb, sQm, sQn, BLOCK: tl.constexpr):
+    pid_b = tle.program_id(0)
+    pid_e = tle.program_id(1)
+    numel = m * qcols
+    offs = pid_e * BLOCK + tl.arange(0, BLOCK)
+    mmask = offs < numel
+    i = offs // qcols
+    j = offs % qcols
+    tl.store(Q + pid_b * sQb + i * sQm + j * sQn, tl.where(i == j, 1.0, 0.0), mask=mmask)
 
 
 # ===========================================================================
@@ -1233,29 +1235,46 @@ def _blocked_qr(W, V, tau, Tbuf, m, n, k, ib=_PANEL_IB):
 def _assemble_q(V, tau, Tbuf, m, n, k, qcols, ib, B, out):
     """Q <- (H_0 H_1 ... H_{P-1}) applied to identity; writes into `out` (B, m, qcols).
 
-    T is already in Tbuf from _blocked_qr for every panel except the last (no
-    trailing update there) -- build that one T, then apply identity + all
-    panels in a single fused launch.
+    T is already in Tbuf from _blocked_qr for every panel except a last panel
+    without a trailing update (kk + ib >= n) -- build that one T first.
+
+    fp32 applies identity + all panels in a single fused launch; fp64 keeps the
+    per-panel larfb path (the fused kernel's runtime-`iba` triangular solve
+    cannot be statically specialised and is slower for fp64).
     """
     P = (k + ib - 1) // ib
     kk_last = (P - 1) * ib
     ib_last = min(ib, k - kk_last)
-    Vp = V[:, kk_last:m, kk_last : kk_last + ib_last]
-    taup = tau[:, kk_last : kk_last + ib_last]
-    Tp = Tbuf[:, kk_last : kk_last + ib_last, kk_last : kk_last + ib_last]
-    _launch_larft(Vp, taup, Tp, m, kk_last, ib_last, B)
+    if kk_last + ib_last >= n:
+        Vp = V[:, kk_last:m, kk_last : kk_last + ib_last]
+        taup = tau[:, kk_last : kk_last + ib_last]
+        Tp = Tbuf[:, kk_last : kk_last + ib_last, kk_last : kk_last + ib_last]
+        _launch_larft(Vp, taup, Tp, m, kk_last, ib_last, B)
 
-    sVb, sVm, sVn = V.stride()
-    sTauB, sTauN = tau.stride()
-    sTb, sTm, sTn = Tbuf.stride()
-    sQb, sQm, sQn = out.stride()
-    grid_p = (qcols + _LARFB_TN - 1) // _LARFB_TN
-    _assemble_q_fused_kernel[(B, grid_p)](
-        V, tau, Tbuf, out, m, n, k, qcols, ib, P,
-        sVb, sVm, sVn, sTauB, sTauN, sTb, sTm, sTn, sQb, sQm, sQn,
-        RM=_LARFB_RM, IBN=_PANEL_IB, TN=_LARFB_TN,
-        SOLVE=V.element_size() != 4,
-    )
+    if V.element_size() == 4:
+        sVb, sVm, sVn = V.stride()
+        sTauB, sTauN = tau.stride()
+        sTb, sTm, sTn = Tbuf.stride()
+        sQb, sQm, sQn = out.stride()
+        grid_p = (qcols + _LARFB_TN - 1) // _LARFB_TN
+        _assemble_q_fused_kernel[(B, grid_p)](
+            V, tau, Tbuf, out, m, n, k, qcols, ib, P,
+            sVb, sVm, sVn, sTauB, sTauN, sTb, sTm, sTn, sQb, sQm, sQn,
+            RM=_LARFB_RM, IBN=_PANEL_IB, TN=_LARFB_TN,
+        )
+    else:
+        # fp64: identity + per-panel larfb (static ib, fast solve path)
+        sQb, sQm, sQn = out.stride()
+        grid_e = (m * qcols + 1023) // 1024
+        _identity_kernel[(B, grid_e)](out, m, qcols, sQb, sQm, sQn, BLOCK=1024)
+        for p in reversed(range(0, k, ib)):
+            kk = p
+            ib_active = min(ib, k - kk)
+            Vp = V[:, kk:m, kk : kk + ib_active]
+            taup = tau[:, kk : kk + ib_active]
+            Tp = Tbuf[:, kk : kk + ib_active, kk : kk + ib_active]
+            _launch_larfb(Vp, taup, Tp, out[:, kk:m, :], m - kk, qcols,
+                          ib_active, B, upper=True)
     return out
 
 
@@ -1301,7 +1320,11 @@ def _tsqr(W, V, tau, Tbuf, m, n, k, mode, B, out_Q=None, out_R=None):
     sRb, sRm, sRn = R_blocks.stride(0), R_blocks.stride(1), R_blocks.stride(2)
     sVb, sVm, sVn = V_local.stride()
     sTauB = TAU_local.stride(0)
-    if br * n <= _TSQR_SRAM_ELEM:
+    # fp64 register tiles cost 2 regs/element, so the single-CTA register
+    # budget is 1/4 of the fp32 element cap (verified: 1024x8 fp64 spills and
+    # is ~2.3x slower than the multi-CTA fallback).
+    sram_elem = _TSQR_SRAM_ELEM // (4 if W.element_size() == 8 else 1)
+    if br * n <= sram_elem:
         # narrow blocks: one register-resident CTA per block (no sync at all)
         # W is read-only here -- keep it pristine for the trsm (Q = A R^{-1}).
         W_pristine = W
