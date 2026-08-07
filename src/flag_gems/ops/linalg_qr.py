@@ -64,6 +64,11 @@ _GEQRT_SRAM_MAX_M = 512
 _LARFB_RM = 64  # row tile for the block-reflector apply kernel
 _LARFB_TN = 32  # column tile for the block-reflector apply kernel (tuned: TN=32
 #                gives ~1.9x on large trailing updates vs TN=16; TN=64 spills)
+# Row tile for the Gram build in larft.  32 keeps every tile exact for the
+# blocked path (panel row counts are always multiples of 32), so the tl.dot
+# operands never carry masked rows -- some Triton backends (Iluvatar corex)
+# miscompile masked rows inside tl.dot and produce NaN.
+_LARFT_RM = 32
 _TSQR_ASPECT = 4  # m >= _TSQR_ASPECT * n  =>  tall-skinny candidate for TSQR
 # TSQR's flat reduction only beats the blocked path (geqrt_sram, zero-sync panels)
 # once m is large enough; below this the per-block local-QR sync overhead dominates
@@ -141,8 +146,9 @@ def _geqrt_kernel(
         beta = tl.where(alpha >= zero, -norm, norm)
         reflect = xnorm_sq > zero
         beta_eff = tl.where(reflect, beta, alpha)
-        tau = tl.where(reflect, (beta - alpha) / beta, zero)
+        tau = tl.where(reflect, (beta - alpha) / tl.where(beta == zero, one, beta), zero)
         denom = alpha - beta
+        denom = tl.where(denom == zero, one, denom)
 
         tl.store(TAUb + (kk + j) * sTauN, tau)
         tl.store(Wb + pivot * sWm + (kk + j) * sWn, beta_eff)
@@ -258,8 +264,9 @@ def _geqrt_mcta_kernel(
             beta = tl.where(alpha >= zero, -norm, norm)
             reflect = xnorm_sq > zero
             beta_eff = tl.where(reflect, beta, alpha)
-            tau = tl.where(reflect, (beta - alpha) / beta, zero)
+            tau = tl.where(reflect, (beta - alpha) / tl.where(beta == zero, one, beta), zero)
             denom = alpha - beta
+            denom = tl.where(denom == zero, one, denom)
             tl.store(TAUb + (kk + j) * sTauN, tau)
             # V from col_j -> global V buffer
             v_tail = col_j / denom
@@ -306,8 +313,9 @@ def _geqrt_mcta_kernel(
             beta = tl.where(alpha >= zero, -norm, norm)
             reflect = xnorm_sq > zero
             beta_eff = tl.where(reflect, beta, alpha)
-            tau = tl.where(reflect, (beta - alpha) / beta, zero)
+            tau = tl.where(reflect, (beta - alpha) / tl.where(beta == zero, one, beta), zero)
             denom = alpha - beta
+            denom = tl.where(denom == zero, one, denom)
             tl.store(TAUb + (kk + j) * sTauN, tau)
             tl.store(Wb + (kk + j) * sWm + (kk + j) * sWn, beta_eff)
 
@@ -421,8 +429,9 @@ def _tsqr_local_kernel(
         beta = tl.where(alpha >= zero, -norm, norm)
         reflect = xnorm_sq > zero
         beta_eff = tl.where(reflect, beta, alpha)
-        tau = tl.where(reflect, (beta - alpha) / beta, zero)
+        tau = tl.where(reflect, (beta - alpha) / tl.where(beta == zero, one, beta), zero)
         denom = alpha - beta
+        denom = tl.where(denom == zero, one, denom)
         tl.store(TAUb + j, tau)
         tl.store(Wb + (blk_start + j) * sWm + j * sWn, beta_eff)
 
@@ -529,8 +538,9 @@ def _tsqr_local_sram_kernel(
         beta = tl.where(alpha >= zero, -norm, norm)
         reflect = xnorm_sq > zero
         beta_eff = tl.where(reflect, beta, alpha)
-        tau = tl.where(reflect, (beta - alpha) / beta, zero)
+        tau = tl.where(reflect, (beta - alpha) / tl.where(beta == zero, one, beta), zero)
         denom = alpha - beta
+        denom = tl.where(denom == zero, one, denom)
         v_tail = col_j / denom
         # R diagonal + reflector tail into the in-register block
         A = tl.where((rm[:, None] == j) & (cn[None, :] == j), beta_eff, A)
@@ -602,8 +612,9 @@ def _qr_fused_kernel(
         beta = tl.where(alpha >= zero, -norm, norm)
         reflect = xnorm_sq > zero
         beta_eff = tl.where(reflect, beta, alpha)
-        tau = tl.where(reflect, (beta - alpha) / beta, zero)
+        tau = tl.where(reflect, (beta - alpha) / tl.where(beta == zero, one, beta), zero)
         denom = alpha - beta
+        denom = tl.where(denom == zero, one, denom)
         v_tail = col_j / denom  # reflector tail (rows > j)
         tau_arr = tl.where(ik == j, tau, tau_arr)
 
@@ -690,8 +701,9 @@ def _geqrt_sram_kernel(
         beta = tl.where(alpha >= zero, -norm, norm)
         reflect = xnorm_sq > zero
         beta_eff = tl.where(reflect, beta, alpha)
-        tau = tl.where(reflect, (beta - alpha) / beta, zero)
+        tau = tl.where(reflect, (beta - alpha) / tl.where(beta == zero, one, beta), zero)
         denom = alpha - beta
+        denom = tl.where(denom == zero, one, denom)
         v_tail = col_j / denom
         # R diagonal + reflector tail into the in-SRAM panel
         A = tl.where((rm[:, None] == j) & (cn[None, :] == j), beta_eff, A)
@@ -755,6 +767,7 @@ def _larft_kernel(
     Tb = MOUT + pid * sMb
 
     dt = Vb.dtype.element_ty
+    zero = tl.zeros((), dtype=dt)
     idx = tl.arange(0, IBN)  # row/col index 0..IBN-1
     num_tiles = (M + RM - 1) // RM
 
@@ -762,9 +775,16 @@ def _larft_kernel(
     G = tl.zeros((IBN, IBN), dtype=dt)
     for t in range(num_tiles):
         rows = t * RM + tl.arange(0, RM)
-        rmask = rows < M
-        v_off = rows[:, None] * sVm + idx[None, :] * sVn
-        Vt = tl.load(Vb + v_off, mask=rmask[:, None] & (idx[None, :] < ib), other=0.0)
+        row_ok = rows < M
+        # Clamp masked lanes to in-bounds indices and zero them explicitly:
+        # some Triton backends (e.g. Iluvatar corex) ignore `other`/mask when
+        # staging tl.dot operands and read garbage -> NaN for partial tiles.
+        rows_safe = tl.where(row_ok, rows, 0)
+        col_ok = idx < ib
+        cols_safe = tl.where(col_ok, idx, 0)
+        v_off = rows_safe[:, None] * sVm + cols_safe[None, :] * sVn
+        Vt = tl.load(Vb + v_off)
+        Vt = tl.where(row_ok[:, None] & col_ok[None, :], Vt, zero)
         G += tl.dot(tl.trans(Vt), Vt, allow_tf32=False)
 
     # ---- M = T^{-1} = triu(G, 1) + diag(1/tau)  (upper triangular) ----
@@ -817,6 +837,7 @@ def _larfb_kernel(
     Cb = C + pid_b * sCb
 
     dt = Cb.dtype.element_ty
+    zero = tl.full((), 0.0, dtype=dt)
     col_idx = tl.arange(0, IBN)
     p_idx = pid_p * TN + tl.arange(0, TN)
     pmask = p_idx < P
@@ -832,11 +853,18 @@ def _larfb_kernel(
     W1 = tl.zeros((IBN, TN), dtype=dt)
     for t in range(num_tiles):
         rows = t * RM + tl.arange(0, RM)
-        rmask = rows < M
-        v_off = rows[:, None] * sVm + col_idx[None, :] * sVn
-        c_off = rows[:, None] * sCm + p_idx[None, :] * sCn
-        Vt = tl.load(Vb + v_off, mask=rmask[:, None] & (col_idx[None, :] < ib), other=0.0)
-        Ct = tl.load(Cb + c_off, mask=rmask[:, None] & pmask[None, :], other=0.0)
+        row_ok = rows < M
+        rows_safe = tl.where(row_ok, rows, 0)
+        col_ok = col_idx < ib
+        cols_safe = tl.where(col_ok, col_idx, 0)
+        p_ok = pmask
+        p_safe = tl.where(p_ok, p_idx, 0)
+        v_off = rows_safe[:, None] * sVm + cols_safe[None, :] * sVn
+        c_off = rows_safe[:, None] * sCm + p_safe[None, :] * sCn
+        Vt = tl.load(Vb + v_off)
+        Ct = tl.load(Cb + c_off)
+        Vt = tl.where(row_ok[:, None] & col_ok[None, :], Vt, zero)
+        Ct = tl.where(row_ok[:, None] & p_ok[None, :], Ct, zero)
         W1 += tl.dot(tl.trans(Vt), Ct, allow_tf32=False)
     W1 = tl.where(col_idx[:, None] < ib, W1, 0.0)
 
@@ -878,13 +906,21 @@ def _larfb_kernel(
     # ---- C[:, p-tile] -= V Y ----
     for t in range(num_tiles):
         rows = t * RM + tl.arange(0, RM)
-        rmask = rows < M
-        v_off = rows[:, None] * sVm + col_idx[None, :] * sVn
-        c_off = rows[:, None] * sCm + p_idx[None, :] * sCn
-        Vt = tl.load(Vb + v_off, mask=rmask[:, None] & (col_idx[None, :] < ib), other=0.0)
-        Ct = tl.load(Cb + c_off, mask=rmask[:, None] & pmask[None, :], other=0.0)
+        row_ok = rows < M
+        rows_safe = tl.where(row_ok, rows, 0)
+        col_ok = col_idx < ib
+        cols_safe = tl.where(col_ok, col_idx, 0)
+        p_ok = pmask
+        p_safe = tl.where(p_ok, p_idx, 0)
+        v_off = rows_safe[:, None] * sVm + cols_safe[None, :] * sVn
+        c_off = rows_safe[:, None] * sCm + p_safe[None, :] * sCn
+        Vt = tl.load(Vb + v_off)
+        Ct = tl.load(Cb + c_off)
+        Vt = tl.where(row_ok[:, None] & col_ok[None, :], Vt, zero)
+        Ct = tl.where(row_ok[:, None] & p_ok[None, :], Ct, zero)
         Ct = Ct - tl.dot(Vt, Y, allow_tf32=False)
-        tl.store(Cb + c_off, Ct, mask=rmask[:, None] & pmask[None, :])
+        c_off_st = rows[:, None] * sCm + p_idx[None, :] * sCn
+        tl.store(Cb + c_off_st, Ct, mask=row_ok[:, None] & p_ok[None, :])
 
 
 # ===========================================================================
@@ -936,11 +972,18 @@ def _assemble_q_fused_kernel(
         W1 = tl.zeros((IBN, TN), dtype=dt)
         for t in range(num_tiles):
             rows = kk + t * RM + rm
-            rmask = rows < m
-            v_off = rows[:, None] * sVm + (kk + col_idx)[None, :] * sVn
-            q_off = rows[:, None] * sQm + p_idx[None, :] * sQn
-            Vt = tl.load(Vb + v_off, mask=rmask[:, None] & (col_idx[None, :] < iba), other=zero)
-            Qt = tl.load(Qb + q_off, mask=rmask[:, None] & pmask[None, :], other=zero)
+            row_ok = rows < m
+            rows_safe = tl.where(row_ok, rows, 0)
+            col_ok = col_idx < iba
+            cols_safe = tl.where(col_ok, col_idx, 0)
+            p_ok = pmask
+            p_safe = tl.where(p_ok, p_idx, 0)
+            v_off = rows_safe[:, None] * sVm + (kk + cols_safe)[None, :] * sVn
+            q_off = rows_safe[:, None] * sQm + p_safe[None, :] * sQn
+            Vt = tl.load(Vb + v_off)
+            Qt = tl.load(Qb + q_off)
+            Vt = tl.where(row_ok[:, None] & col_ok[None, :], Vt, zero)
+            Qt = tl.where(row_ok[:, None] & p_ok[None, :], Qt, zero)
             W1 += tl.dot(tl.trans(Vt), Qt, allow_tf32=False)
         W1 = tl.where(col_idx[:, None] < iba, W1, zero)
         # T_p (upper triangular, pre-built by _blocked_qr / larft)
@@ -954,13 +997,21 @@ def _assemble_q_fused_kernel(
         # Q[kk:m, p-tile] -= V_p Y
         for t in range(num_tiles):
             rows = kk + t * RM + rm
-            rmask = rows < m
-            v_off = rows[:, None] * sVm + (kk + col_idx)[None, :] * sVn
-            q_off = rows[:, None] * sQm + p_idx[None, :] * sQn
-            Vt = tl.load(Vb + v_off, mask=rmask[:, None] & (col_idx[None, :] < iba), other=zero)
-            Qt = tl.load(Qb + q_off, mask=rmask[:, None] & pmask[None, :], other=zero)
+            row_ok = rows < m
+            rows_safe = tl.where(row_ok, rows, 0)
+            col_ok = col_idx < iba
+            cols_safe = tl.where(col_ok, col_idx, 0)
+            p_ok = pmask
+            p_safe = tl.where(p_ok, p_idx, 0)
+            v_off = rows_safe[:, None] * sVm + (kk + cols_safe)[None, :] * sVn
+            q_off = rows_safe[:, None] * sQm + p_safe[None, :] * sQn
+            Vt = tl.load(Vb + v_off)
+            Qt = tl.load(Qb + q_off)
+            Vt = tl.where(row_ok[:, None] & col_ok[None, :], Vt, zero)
+            Qt = tl.where(row_ok[:, None] & p_ok[None, :], Qt, zero)
             Qt = Qt - tl.dot(Vt, Y, allow_tf32=False)
-            tl.store(Qb + q_off, Qt, mask=rmask[:, None] & pmask[None, :])
+            q_off_st = rows[:, None] * sQm + p_idx[None, :] * sQn
+            tl.store(Qb + q_off_st, Qt, mask=row_ok[:, None] & p_ok[None, :])
 
 
 # ===========================================================================
@@ -994,8 +1045,12 @@ def _assemble_q_single_panel_kernel(
     rm = tl.arange(0, RM)
 
     # W1 = T @ V[p_idx, :]^H  (IBN x TN); identity rows of Q are exactly p_idx
-    Vrows = tl.load(Vb + p_idx[:, None] * sVm + col_idx[None, :] * sVn,
-                    mask=(p_idx[:, None] < m) & (col_idx[None, :] < n), other=zero)
+    row_ok = p_idx < m
+    rows_safe = tl.where(row_ok, p_idx, 0)
+    col_ok = col_idx < n
+    cols_safe = tl.where(col_ok, col_idx, 0)
+    Vrows = tl.load(Vb + rows_safe[:, None] * sVm + cols_safe[None, :] * sVn)
+    Vrows = tl.where(row_ok[:, None] & col_ok[None, :], Vrows, zero)
     Tt = tl.load(Tb + col_idx[:, None] * sTm + col_idx[None, :] * sTn,
                  mask=(col_idx[:, None] < n) & (col_idx[None, :] < n), other=zero)
     W1 = tl.dot(Tt, tl.trans(Vrows), allow_tf32=False)
@@ -1004,13 +1059,14 @@ def _assemble_q_single_panel_kernel(
     # Q_tile = I_tile - V_t @ W1, written once
     for t in range((m + RM - 1) // RM):
         rows = t * RM + rm
-        rmask = rows < m
-        Vt = tl.load(Vb + rows[:, None] * sVm + col_idx[None, :] * sVn,
-                     mask=rmask[:, None] & (col_idx[None, :] < n), other=zero)
+        r_ok = rows < m
+        r_safe = tl.where(r_ok, rows, 0)
+        Vt = tl.load(Vb + r_safe[:, None] * sVm + cols_safe[None, :] * sVn)
+        Vt = tl.where(r_ok[:, None] & col_ok[None, :], Vt, zero)
         Qt = tl.where(rows[:, None] == p_idx[None, :], one, zero)
         Qt = Qt - tl.dot(Vt, W1, allow_tf32=False)
         tl.store(Qb + rows[:, None] * sQm + p_idx[None, :] * sQn, Qt,
-                 mask=rmask[:, None] & pmask[None, :])
+                 mask=r_ok[:, None] & pmask[None, :])
 
 
 # ===========================================================================
@@ -1174,7 +1230,7 @@ def _launch_larft(V, tau, Tout, m, kk, ib, B):
     sTb, sTm, sTn = Tout.stride()
     _larft_kernel[(B,)](
         V, tau, Tout, M, ib, sVb, sVm, sVn, sTauB, sTauN, sTb, sTm, sTn,
-        RM=_PANEL_RM, IBN=_PANEL_IB, INVERT=V.element_size() == 4,
+        RM=_LARFT_RM, IBN=_PANEL_IB, INVERT=V.element_size() == 4,
     )
 
 
@@ -1381,10 +1437,11 @@ def _tsqr(W, V, tau, Tbuf, m, n, k, mode, B, out_Q=None, out_R=None):
     # ---- Phase 1: fused local QR of ALL blocks in one launch ----
     R_blocks = torch.empty(B, num_blocks, n, n, dtype=dt, device=dev)
     k_max = min(br, n)
-    # V_local / TAU_local are fully written by the local-QR kernel before read,
-    # so use torch.empty (avoids the zeros re-dispatch kernel under use_gems).
-    V_local = torch.empty(B, m, n, dtype=dt, device=dev)
-    TAU_local = torch.empty(B, num_blocks, n, dtype=dt, device=dev)
+    # Zero-init: some Triton backends read uninitialised padding beyond masked
+    # loads in tl.dot (garbage -> NaN propagation), so the factor buffers are
+    # never left as torch.empty.
+    V_local = torch.zeros(B, m, n, dtype=dt, device=dev)
+    TAU_local = torch.zeros(B, num_blocks, n, dtype=dt, device=dev)
     sWb, sWm, sWn = W.stride()
     sRb, sRm, sRn = R_blocks.stride(0), R_blocks.stride(1), R_blocks.stride(2)
     sVb, sVm, sVn = V_local.stride()
@@ -1536,6 +1593,25 @@ def linalg_qr(A, mode="reduced", *, out=None):
         out_Q, out_R = out
         out_Q = out_Q.reshape(B, m, qcols) if qcols else out_Q.reshape(0)
         out_R = out_R.reshape(B, rrows, n)
+    if m == 1:
+        # A single-row matrix needs no reflection: Q = [1] (1x1), R = A.
+        # Handled with plain tensor ops -- (1, N) register tiles are
+        # miscompiled on some Triton backends (e.g. iluvatar corex) and this
+        # path is exact on every backend.
+        A2 = A.reshape(B, 1, n)
+        if mode == "r":
+            R = out_R if out_R is not None else A2.clone()
+            if out_R is not None:
+                out_R.copy_(A2)
+            return (out_Q if out_Q is not None else A.new_empty(0),
+                    R.reshape(*batch_shape, 1, n))
+        Q = out_Q if out_Q is not None else A.new_ones(B, 1, 1)
+        if out_Q is not None:
+            out_Q.fill_(1.0)
+        R = out_R if out_R is not None else A2.clone()
+        if out_R is not None:
+            out_R.copy_(A2)
+        return (Q.reshape(*batch_shape, 1, 1), R.reshape(*batch_shape, 1, n))
     # TSQR only for tall-skinny that fused can't fit (m*n > _FUSED_ELEM or m > _FUSED_M);
     # smaller tall-skinny (e.g. 64×16, 128×32) are faster via the single-launch fused kernel.
     # TSQR also needs m >= _TSQR_MIN_M -- below that the blocked path's zero-sync SRAM
@@ -1558,13 +1634,13 @@ def linalg_qr(A, mode="reduced", *, out=None):
         return _fused_qr(W, A, orig_dtype, batch_shape, m, n, k, mode, B, out_Q, out_R)
 
     # large matrices: allocate the blocked-QR scratch and pick TSQR vs blocked.
-    # Use torch.empty (not torch.zeros): under use_gems, torch.zeros re-dispatches
-    # to a gems zeros *kernel* (one extra launch each).  V/tau/Tbuf are fully
-    # written by the geqrt/larft kernels before they are read, so no zero-init
-    # is needed.
-    V = torch.empty(B, m, k, dtype=W.dtype, device=W.device)
-    tau = torch.empty(B, k, dtype=W.dtype, device=W.device)
-    Tbuf = torch.empty(B, k, k, dtype=W.dtype, device=W.device)
+    # Zero-init the factor buffers: some Triton backends (e.g. Iluvatar corex)
+    # read uninitialised padding beyond masked loads in tl.dot, which turns
+    # torch.empty garbage into NaN that propagates through larft/larfb.  The
+    # extra zeros kernels are negligible next to the factorization itself.
+    V = torch.zeros(B, m, k, dtype=W.dtype, device=W.device)
+    tau = torch.zeros(B, k, dtype=W.dtype, device=W.device)
+    Tbuf = torch.zeros(B, k, k, dtype=W.dtype, device=W.device)
 
     tall_skinny = is_ts
     if tall_skinny:
