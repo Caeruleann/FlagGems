@@ -964,6 +964,56 @@ def _assemble_q_fused_kernel(
 
 
 # ===========================================================================
+# Kernel 3c: single-panel Q assembly in one pass (fp32).
+# When the whole factorization is one panel (k <= IB, P == 1), the block
+# reflector is H = I - V T V^H, so Q = H I = I - V T V^H.  W1 = T V[p,:]^H
+# is read straight off V's rows (no need to read Q back), and each output
+# tile is written exactly once:  Q_tile = I_tile - V_t @ W1.  This removes
+# the per-tile serial W1 build over the m rows and the Q re-reads that the
+# generic _assemble_q_fused_kernel does (measured ~5x on 8192x8 complete).
+# ===========================================================================
+@libentry()
+@triton.jit
+def _assemble_q_single_panel_kernel(
+    V, T, Q, m, n, qcols,
+    sVb, sVm, sVn, sTb, sTm, sTn, sQb, sQm, sQn,
+    RM: tl.constexpr, TN: tl.constexpr, IBN: tl.constexpr,
+):
+    pid_b = tle.program_id(0)
+    pid_p = tle.program_id(1)
+    Vb = V + pid_b * sVb
+    Tb = T + pid_b * sTb
+    Qb = Q + pid_b * sQb
+
+    dt = Vb.dtype.element_ty
+    zero = tl.full((), 0.0, dtype=dt)
+    one = tl.full((), 1.0, dtype=dt)
+    col_idx = tl.arange(0, IBN)           # padded reflector columns
+    p_idx = pid_p * TN + tl.arange(0, TN) # Q columns of this CTA
+    pmask = p_idx < qcols
+    rm = tl.arange(0, RM)
+
+    # W1 = T @ V[p_idx, :]^H  (IBN x TN); identity rows of Q are exactly p_idx
+    Vrows = tl.load(Vb + p_idx[:, None] * sVm + col_idx[None, :] * sVn,
+                    mask=(p_idx[:, None] < m) & (col_idx[None, :] < n), other=zero)
+    Tt = tl.load(Tb + col_idx[:, None] * sTm + col_idx[None, :] * sTn,
+                 mask=(col_idx[:, None] < n) & (col_idx[None, :] < n), other=zero)
+    W1 = tl.dot(Tt, tl.trans(Vrows), allow_tf32=False)
+    W1 = tl.where(col_idx[:, None] < n, W1, zero)
+
+    # Q_tile = I_tile - V_t @ W1, written once
+    for t in range((m + RM - 1) // RM):
+        rows = t * RM + rm
+        rmask = rows < m
+        Vt = tl.load(Vb + rows[:, None] * sVm + col_idx[None, :] * sVn,
+                     mask=rmask[:, None] & (col_idx[None, :] < n), other=zero)
+        Qt = tl.where(rows[:, None] == p_idx[None, :], one, zero)
+        Qt = Qt - tl.dot(Vt, W1, allow_tf32=False)
+        tl.store(Qb + rows[:, None] * sQm + p_idx[None, :] * sQn, Qt,
+                 mask=rmask[:, None] & pmask[None, :])
+
+
+# ===========================================================================
 # Kernel 4: copy the upper triangle of W into R (zero below).  R[i,j]=W[i,j] if i<=j.
 # ===========================================================================
 @libentry()
@@ -1241,7 +1291,8 @@ def _assemble_q(V, tau, Tbuf, m, n, k, qcols, ib, B, out):
     T is already in Tbuf from _blocked_qr for every panel except a last panel
     without a trailing update (kk + ib >= n) -- build that one T first.
 
-    fp32 applies identity + all panels in a single fused launch; fp64 keeps the
+    fp32 uses the one-pass single-panel kernel when P == 1 (Q = I - V T V^H,
+    no Q re-reads), otherwise the fused all-panels kernel; fp64 keeps the
     per-panel larfb path (the fused kernel's runtime-`iba` triangular solve
     cannot be statically specialised and is slower for fp64).
     """
@@ -1254,7 +1305,21 @@ def _assemble_q(V, tau, Tbuf, m, n, k, qcols, ib, B, out):
         Tp = Tbuf[:, kk_last : kk_last + ib_last, kk_last : kk_last + ib_last]
         _launch_larft(Vp, taup, Tp, m, kk_last, ib_last, B)
 
-    if V.element_size() == 4:
+    if V.element_size() == 4 and P == 1:
+        # single panel: Q = I - V T V^H written once (one launch)
+        Vp = V[:, :, :k]
+        Tp = Tbuf[:, :k, :k]
+        sVb, sVm, sVn = Vp.stride()
+        sTb, sTm, sTn = Tp.stride()
+        sQb, sQm, sQn = out.stride()
+        ibn = max(16, triton.next_power_of_2(k))
+        grid_p = (qcols + _LARFB_TN - 1) // _LARFB_TN
+        _assemble_q_single_panel_kernel[(B, grid_p)](
+            Vp, Tp, out, m, n, qcols,
+            sVb, sVm, sVn, sTb, sTm, sTn, sQb, sQm, sQn,
+            RM=_LARFB_RM, TN=_LARFB_TN, IBN=ibn,
+        )
+    elif V.element_size() == 4:
         sVb, sVm, sVn = V.stride()
         sTauB, sTauN = tau.stride()
         sTb, sTm, sTn = Tbuf.stride()
