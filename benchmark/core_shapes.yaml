@@ -83,38 +83,6 @@ linalg_lu_factor:
     - [4096, 512, 512]
   shape_desc: "input shape"
 
-# QR shapes cover every routing path of the op: fused (small square / tall /
-# wide), blocked (large square), TSQR (tall-skinny), batched.  Wide shapes
-# (m < n) are included since they exercise a different Q/R layout; the
-# "complete" mode benchmarks skip them (complete requires m >= n).
-linalg_qr_shapes: &linalg_qr_shapes
-  shapes:
-    - [8, 8]
-    - [64, 64]
-    - [256, 256]
-    - [512, 512]
-    - [1024, 1024]
-    - [4096, 4096]
-    - [128, 32]
-    - [512, 64]
-    - [4096, 4]
-    - [8192, 8]
-    - [8, 32]
-    - [16, 64]
-    - [32, 128]
-    - [64, 256]
-    - [64, 8, 8]
-    - [128, 32, 32]
-    - [32, 128, 128]
-    - [4, 1024, 1024]
-  shape_desc: "(*B), M, N"
-
-linalg_qr:
-  <<: *linalg_qr_shapes
-
-linalg_qr_out:
-  <<: *linalg_qr_shapes
-
 linalg_lu_factor_out:
   shapes:
     - [16, 16]
@@ -132,6 +100,58 @@ linalg_lu_factor_out:
     - [1024, 512, 512]
     - [4096, 512, 512]
   shape_desc: "input shape"
+
+linalg_qr:
+  shapes:
+    # square: tiny → large
+    - [8, 8]
+    - [64, 64]
+    - [256, 256]
+    - [512, 512]
+    - [1024, 1024]
+    - [4096, 4096]
+    # tall (m > n): fused, routing-win, TSQR
+    - [128, 32]
+    - [512, 64]
+    - [4096, 4]
+    - [8192, 8]
+    # wide (m < n)
+    - [8, 32]
+    - [16, 64]
+    - [32, 128]
+    - [64, 256]
+    # batched
+    - [64, 8, 8]
+    - [128, 32, 32]
+    - [32, 128, 128]
+    - [4, 1024, 1024]
+  shape_desc: "(*B), M, N"
+
+linalg_qr_out:
+  shapes:
+    # square: tiny → large
+    - [8, 8]
+    - [64, 64]
+    - [256, 256]
+    - [512, 512]
+    - [1024, 1024]
+    - [4096, 4096]
+    # tall (m > n): fused, routing-win, TSQR
+    - [128, 32]
+    - [512, 64]
+    - [4096, 4]
+    - [8192, 8]
+    # wide (m < n)
+    - [8, 32]
+    - [16, 64]
+    - [32, 128]
+    - [64, 256]
+    # batched
+    - [64, 8, 8]
+    - [128, 32, 32]
+    - [32, 128, 128]
+    - [4, 1024, 1024]
+  shape_desc: "(*B), M, N"
 
 segment_reduce: &segment_reduce_shapes
   shapes:
