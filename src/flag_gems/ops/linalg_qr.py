@@ -92,12 +92,12 @@ _TSQR_MIN_M = 700
 # tile live; smaller blocks give shorter serial reflector chains and more CTAs.
 # fp64's 2 regs/element halves the tile budget: br=128 measured ~2x faster than
 # 512 on narrow fp64 blocks ((4096,4)/(8192,8)); fp32 stays at 512.
-_TSQR_FIN_BR = 512  # row-block cap for the local QR (fp32)
-_TSQR_FIN_BR_FP64 = 128
+_TSQR_BR = 512  # row-block cap for the local QR (fp32)
+_TSQR_BR_FP64 = 128
 # Cap on the padded tree-reduction tile BRM*IBN (fp32 elements): one CTA per
 # batch factors the stacked R's in registers when it fits; taller stacks go
 # through the blocked path instead.
-_TSQR_FIN_RED_ELEM = 16384
+_TSQR_TREE_RED_ELEM = 16384
 # Max elements per TSQR row block for the register-resident single-CTA local
 # QR (no atomics / cross-CTA barriers / global re-reads).
 _TSQR_SRAM_ELEM = 16384
@@ -130,7 +130,7 @@ _ASSEMBLE_PAIR_WARPS = 8
 # (None = Triton default; swept on H20).
 _LARFB_STAGES = None
 _ASSEMBLE_STAGES = None
-_TSQR_FIN_WARPS = 4
+_TSQR_TREE_WARPS = 4
 
 
 # ===========================================================================
@@ -241,13 +241,12 @@ def _geqrt_kernel(
 
 
 # ===========================================================================
-# Kernel 1a: multi-CTA panel factorisation (row-split across NC CTAs).
+# Kernel 2: multi-CTA panel factorisation (row-split across NC CTAs).
 # For tall panels the single-CTA geqrt leaves most SMs idle because the
 # reflector chain is serial.  Here the panel rows are split across NC CTAs;
 # each CTA owns a contiguous row range, so the only cross-CTA coordination is
-# the two per-column reductions (alpha/norm after pass A, w after pass C),
-# done with atomic_add + a spinning counter barrier.  Everything else (passes
-# B and D, reading V/W) touches only a CTA's own rows.
+# the per-column reductions (alpha/norm and the unscaled w partials, both
+# accumulated before ONE spinning-counter barrier per reflector).
 # ===========================================================================
 @triton.jit
 def _barrier(ctr, off, NC):
@@ -415,7 +414,7 @@ def _geqrt_mcta_kernel(
 
 
 # ===========================================================================
-# Kernel 1e: register-resident TSQR local QR.  One CTA per row block; the
+# Kernel 3: register-resident TSQR local QR.  One CTA per row block; the
 # whole block tile (BM x IBN) lives in registers across the reflector chain --
 # no atomics, no cross-CTA barriers, no global re-reads.
 # Output: R_blocks[block] = triu(local R); with STORE_V the reflectors
@@ -487,7 +486,7 @@ def _tsqr_local_sram_kernel(
 
 
 # ===========================================================================
-# Kernel 1f: TSQR tree reduction -- factor the stacked local R's
+# Kernel 4: TSQR tree reduction -- factor the stacked local R's
 # ((num_blocks*n) x n) in registers, one CTA per batch, storing the reflectors
 # in place (LAPACK style: v tail below the pivot, beta on the diagonal).
 # Then Q_t = H_0 H_1 ... H_{n-1} [I; 0] is built by applying the reflectors to
@@ -557,7 +556,7 @@ def _tsqr_tree_kernel(
 
 
 # ===========================================================================
-# Kernel 1g: TSQR Q application -- one CTA per row block.  Rebuilds the block's
+# Kernel 5: TSQR Q application -- one CTA per row block.  Rebuilds the block's
 # local Q factor from its stored reflectors (reverse application to [I; 0],
 # robust to zero columns) and multiplies by the block's rows of the tree factor:
 #     Q[block rows] = Q_local @ Q_t[block*n : block*n+n, :]
@@ -610,14 +609,7 @@ def _tsqr_apply_kernel(
 
 
 # ===========================================================================
-# Kernel 1b: fused QR for matrices that fit in shared memory.
-# One CTA per matrix does the *entire* job -- unblocked Householder
-# factorisation, R extraction and (optionally) Q assembly -- operating on
-# in-SRAM tiles with no global round-trips and no per-panel launches.  This is
-# what makes single small/medium matrices competitive (one launch instead of
-# ~20).
-# ===========================================================================
-# Kernel 1b: fused QR for matrices that fit in shared memory.
+# Kernel 6: fused QR for matrices that fit in shared memory.
 # One CTA per matrix does the *entire* job -- unblocked Householder
 # factorisation, R extraction and (optionally) Q assembly -- operating on
 # in-SRAM tiles with no global round-trips and no per-panel launches.  This is
@@ -705,7 +697,7 @@ def _qr_fused_kernel(
 
 
 # ===========================================================================
-# Kernel 1d: SRAM-resident panel factorisation (blocked-path geqrt replacement).
+# Kernel 7: SRAM-resident panel factorisation (blocked-path geqrt replacement).
 # The multi-CTA _geqrt_mcta_kernel re-reads the panel from global memory on each
 # of its 4 passes per reflector and, for moderately-tall panels (e.g. 256x32),
 # only spawns NC = M/RM ~= 4 CTAs -- severe SM under-utilisation plus redundant
@@ -775,7 +767,7 @@ def _geqrt_sram_kernel(
 
 
 # ===========================================================================
-# Kernel 2: build the WY factor T (DLARFT, Gram-solve form).  One CTA per
+# Kernel 8: build the WY factor T (DLARFT, Gram-solve form).  One CTA per
 # batch element.
 #
 # The Gram-solve trick (ml-mike.com/writing/qr_v2) builds M = T^{-1} directly
@@ -861,7 +853,7 @@ def _larft_kernel(
 
 
 # ===========================================================================
-# Kernel 3: apply block reflector H = I - V T V^H on the left (DLARFB).
+# Kernel 9: apply block reflector H = I - V T V^H on the left (DLARFB).
 #   C <- C - V Y,  Y = T @ W1   (Q assembly,   UPPER=True)
 #   C <- C - V Y,  Y = T^H @ W1 (trailing update, UPPER=False)
 # with T pre-computed (inverted) by _larft_kernel -- plain GEMMs only, no
@@ -952,7 +944,7 @@ def _larfb_kernel(
 
 
 # ===========================================================================
-# Kernel 3d: compose pairs of adjacent panel T's into one (2*ib) x (2*ib)
+# Kernel 10: compose pairs of adjacent panel T's into one (2*ib) x (2*ib)
 # compact-WY factor, for the paired Q-assembly path (fp32).
 #   H_2g H_{2g+1} = I - [V1 V2] T_pair [V1 V2]^H,
 #   T_pair = [[T1, -T1 (V1^H V2) T2], [0, T2]]
@@ -1015,7 +1007,7 @@ def _tcompose_pair_kernel(
 
 
 # ===========================================================================
-# Kernel 3b: fused Q assembly -- identity + all panels in ONE launch.
+# Kernel 11: fused Q assembly -- identity + all panels in ONE launch.
 # Q <- (H_0 H_1 ... H_{P-1}) applied to identity: each CTA owns a TN-wide
 # column slice of Q and loops the panels in reverse, loading V_p/T_p and
 # applying Q <- Q - V_p (T_p (V_p^H Q)) with the same GEMM-only body as
@@ -1091,7 +1083,7 @@ def _assemble_q_fused_kernel(
 
 
 # ===========================================================================
-# Kernel 3c: single-panel Q assembly in one pass (fp32).
+# Kernel 12: single-panel Q assembly in one pass (fp32).
 # When the whole factorization is one panel (k <= IB, P == 1), the block
 # reflector is H = I - V T V^H, so Q = H I = I - V T V^H.  W1 = T V[p,:]^H
 # is read straight off V's rows (no need to read Q back), and each output
@@ -1144,7 +1136,7 @@ def _assemble_q_single_panel_kernel(
 
 
 # ===========================================================================
-# Kernel 4: copy the upper triangle of W into R (zero below).  R[i,j]=W[i,j] if i<=j.
+# Kernel 13: copy the upper triangle of W into R (zero below).  R[i,j]=W[i,j] if i<=j.
 # ===========================================================================
 @libentry()
 @triton.jit
@@ -1161,7 +1153,7 @@ def _triu_copy_kernel(W, ROUT, rm, n, sWb, sWm, sWn, sRb, sRm, sRn, BLOCK: tl.co
 
 
 # ===========================================================================
-# Kernel 5: write an identity matrix into Q (m x qcols)
+# Kernel 14: write an identity matrix into Q (m x qcols)
 # ===========================================================================
 @libentry()
 @triton.jit
@@ -1472,13 +1464,13 @@ def _tsqr(W, m, n, k, mode, B, out_Q=None, out_R=None):
     # budget is 1/4 of the fp32 element cap.
     reg_scale = 4 if W.element_size() == 8 else 1
     sram_elem = _TSQR_SRAM_ELEM // reg_scale
-    red_elem = _TSQR_FIN_RED_ELEM // reg_scale
+    red_elem = _TSQR_TREE_RED_ELEM // reg_scale
     write_Q = mode != "r"
 
     # Row-block size: the local kernel keeps a (pow2(br), IBN) register tile.
     # Every block must hold >= n+1 rows (a shorter block could not produce n
     # orthonormal local Q columns), so rebalance until the last block does.
-    fin_br = _TSQR_FIN_BR if W.element_size() == 4 else _TSQR_FIN_BR_FP64
+    fin_br = _TSQR_BR if W.element_size() == 4 else _TSQR_BR_FP64
     br = max(n + 1, min(m, fin_br, sram_elem // n))
     num_blocks = (m + br - 1) // br
     while num_blocks > 1 and m - (num_blocks - 1) * br < n + 1:
@@ -1521,7 +1513,7 @@ def _tsqr(W, m, n, k, mode, B, out_Q=None, out_R=None):
             Racc.stride(0), Racc.stride(1), Racc.stride(2),
             Qt.stride(0), Qt.stride(1), Qt.stride(2),
             BRM=BRM, IBN=IBN,
-            num_warps=_TSQR_FIN_WARPS,
+            num_warps=_TSQR_TREE_WARPS,
         )
     else:
         # Stack too tall for one CTA: factor it with the blocked path (the
@@ -1608,9 +1600,8 @@ def linalg_qr(A, mode="reduced", *, out=None):
             Q.copy_(eye.expand(*batch_shape, m, m))
         return Q, R
 
-    # Read-only view of A.  The fused path and the TSQR register-resident path
-    # never write W (kernels only read it), so no copy is needed there; the
-    # mutating paths (blocked / multi-CTA TSQR) clone below.
+    # Read-only view of A.  The fused and TSQR paths only read W (no copy
+    # needed); the blocked path factors in place and clones below.
     W = A.reshape(B, m, n)
 
     qcols = 0 if mode == "r" else (k if mode == "reduced" else m)
@@ -1626,7 +1617,7 @@ def linalg_qr(A, mode="reduced", *, out=None):
     # TSQR only for tall-skinny that fused can't fit (m*n > _FUSED_ELEM or m > _FUSED_M);
     # smaller tall-skinny (e.g. 64×16, 128×32) are faster via the single-launch fused kernel.
     # TSQR also needs m >= _TSQR_MIN_M -- below that the blocked path's zero-sync SRAM
-    # panels beat TSQR's per-block local-QR sync (e.g. 512x64, 256x64).
+    # panels beat TSQR's per-block serial reflector chains (e.g. 512x64, 256x64).
     is_ts = (m >= _TSQR_ASPECT * n) and (m >= _TSQR_MIN_M) and (n > 0) and (n <= _TSQR_MAX_N) and (mode in ("reduced", "r"))
     # _FUSED_ELEM is calibrated for fp32; fp64 doubles register pressure in the
     # fused kernel (A tile + Q tile both live during Q assembly), so larger fp64
@@ -1639,16 +1630,11 @@ def linalg_qr(A, mode="reduced", *, out=None):
                   and (mode == "r" or qcols * m <= fused_elem))
     if is_ts:
         fits_fused = fits_fused and (m <= _FUSED_TALL_M)
-    tall_skinny = is_ts and not fits_fused
-    fused = fits_fused
-    if fused:
+    if fits_fused:
         return _fused_qr(W, A, orig_dtype, batch_shape, m, n, k, mode, B, out_Q, out_R)
 
-    # large matrices: pick TSQR vs blocked.  Scratch buffers are allocated
-    # lazily by the branch that needs them (the fused-finish TSQR path needs
-    # no V/tau/Tbuf at all).
-    tall_skinny = is_ts
-    if tall_skinny:
+    # large matrices: TSQR for tall-skinny, blocked Householder otherwise.
+    if is_ts:
         Qm, Rm = _tsqr(W, m, n, k, mode, B, out_Q, out_R)
         if mode == "r":
             return (out_Q if out_Q is not None else A.new_empty(0),
