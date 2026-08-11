@@ -98,6 +98,16 @@ _TSQR_BR_FP64 = 128
 # batch factors the stacked R's in registers when it fits; taller stacks go
 # through the blocked path instead.
 _TSQR_TREE_RED_ELEM = 16384
+# Tall fp64 stacks are never reduced flat (single CTA): the serial per-reflector
+# tile reductions are so slow in fp64 that the two-level tree wins even when the
+# tile fits the register budget.  This is the fp64 flat cutoff, in padded rows.
+_TSQR_TREE_FLAT_ROWS = 128
+# Below this padded stack-tile size (BRMt*IBN elements, fp32 only) every apply
+# CTA can afford to redundantly factor the stacked local R's in registers,
+# folding the tree reduction into the apply kernel and saving one kernel
+# launch.  Larger tiles lose: the redundant factorisation's register pressure
+# and serial reductions outweigh the saved launch overhead.
+_TSQR_FOLD_ELEM = 1024
 # Max elements per TSQR row block for the register-resident single-CTA local
 # QR (no atomics / cross-CTA barriers / global re-reads).
 _TSQR_SRAM_ELEM = 16384
@@ -486,35 +496,47 @@ def _tsqr_local_sram_kernel(
 
 
 # ===========================================================================
-# Kernel 4: TSQR tree reduction -- factor the stacked local R's
-# ((num_blocks*n) x n) in registers, one CTA per batch, storing the reflectors
-# in place (LAPACK style: v tail below the pivot, beta on the diagonal).
-# Then Q_t = H_0 H_1 ... H_{n-1} [I; 0] is built by applying the reflectors to
+# Kernel 4: TSQR tree reduction -- factor (a group slice of) the stacked local
+# R's ((num_blocks*n) x n) in registers, storing the reflectors in place
+# (LAPACK style: v tail below the pivot, beta on the diagonal).  Grid is
+# (B, num_groups): CTA (b, g) factors rows [g*grp*n, min((g+1)*grp*n,
+# num_blocks*n)) of the stack, writes its n x n R factor to R_out[g] and its
+# Q factor back to the same rows of Qt.
+# Q_t = H_0 H_1 ... H_{n-1} [I; 0] is built by applying the reflectors to
 # the identity in REVERSE order (single extra register tile, no R inverse --
 # robust to exactly rank-deficient inputs, unlike Q = A R^{-1}).
-# Used when the padded stack tile (BRM x IBN) fits the register budget; larger
-# stacks go through the blocked path (_blocked_qr + _assemble_q) instead.
+# A single group (num_groups == 1) covers the whole stack (flat reduction);
+# with several groups this is the first/second level of a two-level tree.
+# Stacks too tall even for the tree go through the blocked path
+# (_blocked_qr + _assemble_q) instead.
 # ===========================================================================
 @libentry()
 @triton.jit
 def _tsqr_tree_kernel(
-    Rblocks, R_out, Qt, n, num_blocks, write_Q,
-    sRBb, sRBm, sRBn, sRb, sRm, sRn, sQb, sQm, sQn,
+    Rblocks, R_out, Qt, n, num_blocks, grp, write_Q,
+    sRb, sRm, sRn,
     BRM: tl.constexpr, IBN: tl.constexpr,
 ):
     pid_b = tle.program_id(0)
+    pid_g = tle.program_id(1)
     dt = Rblocks.dtype.element_ty
     zero = tl.full((), 0.0, dtype=dt)
     one = tl.full((), 1.0, dtype=dt)
 
-    rr = tl.arange(0, BRM)  # reduction rows (padded num_blocks*n)
+    # Rblocks and Qt are internal contiguous buffers: a (B, num_blocks, n, n)
+    # stack viewed as (B, num_blocks*n, n); Qt shares the layout.  Only the
+    # R_out strides are passed (it may be the caller's non-contiguous out_R).
+    rb_batch = num_blocks * n * n
+    rr = tl.arange(0, BRM)  # reduction rows (padded grp*n)
     cn = tl.arange(0, IBN)  # padded n
-    Rm = num_blocks * n
+    row0 = pid_g * grp * n
+    Rm = tl.minimum(grp, num_blocks - pid_g * grp) * n
     redmask = rr < Rm
     cmask = cn < n
 
     # ---- factor the stacked local R factors, reflectors kept in place ----
-    G = tl.load(Rblocks + pid_b * sRBb + rr[:, None] * sRBm + cn[None, :] * sRBn,
+    G = tl.load(Rblocks + pid_b * rb_batch + (row0 + rr)[:, None] * n
+                + cn[None, :],
                 mask=redmask[:, None] & cmask[None, :], other=zero)
     tau_vec = tl.zeros([IBN], dtype=dt)
     for j in range(n):
@@ -538,7 +560,8 @@ def _tsqr_tree_kernel(
     # R = triu of the first n rows (the v tails live at rows > j, the diagonal
     # holds beta_eff, so rows < n are exactly R's upper triangle).
     R_tile = tl.where(rr[:, None] <= cn[None, :], G, zero)
-    tl.store(R_out + pid_b * sRb + rr[:, None] * sRm + cn[None, :] * sRn,
+    tl.store(R_out + pid_b * sRb + (pid_g * n + rr)[:, None] * sRm
+             + cn[None, :] * sRn,
              R_tile, mask=(rr[:, None] < n) & cmask[None, :])
 
     if write_Q:
@@ -551,28 +574,41 @@ def _tsqr_tree_kernel(
             tau_j = tl.sum(tl.where(cn == j, tau_vec, zero))
             w = tau_j * tl.sum(vj[:, None] * X, axis=0)
             X = X - vj[:, None] * w[None, :]
-        tl.store(Qt + pid_b * sQb + rr[:, None] * sQm + cn[None, :] * sQn,
+        tl.store(Qt + pid_b * rb_batch + (row0 + rr)[:, None] * n
+                 + cn[None, :],
                  X, mask=redmask[:, None] & cmask[None, :])
 
 
 # ===========================================================================
 # Kernel 5: TSQR Q application -- one CTA per row block.  Rebuilds the block's
 # local Q factor from its stored reflectors (reverse application to [I; 0],
-# robust to zero columns) and multiplies by the block's rows of the tree factor:
-#     Q[block rows] = Q_local @ Q_t[block*n : block*n+n, :]
+# robust to zero columns) and multiplies by the tree factor(s):
+#     flat:       Q[block rows] = Q_local @ Q_t[block*n : block*n+n, :]
+#     two-level:  Q[block rows] = Q_local @ Q_g[block rows] @ Q_t[group rows]
+# where Q_g is the first-level (group) factor and Q_t the top-level one.
+# FOLD_TREE (small stacks): every CTA redundantly factors the stacked local
+# R's in registers and builds Q_t itself (a few tiny reflector steps), which
+# eliminates the separate tree-reduction launch -- kernel-launch overhead
+# dominates TSQR on small tall-skinny inputs.  CTA (b, 0) also writes R.
 # ===========================================================================
 @libentry()
 @triton.jit
 def _tsqr_apply_kernel(
-    V_local, TAU_local, Qt, Q,
-    m, n, br, k_max,
-    sVb, sVm, sVn, sTauB, sQtb, sQtm, sQtn, sQb, sQm, sQn,
-    BM: tl.constexpr, IBN: tl.constexpr,
+    V_local, TAU_local, Qt, Qt2, Q, Rblocks, Racc,
+    m, n, br, k_max, grp, num_blocks,
+    sQb, sQm, sQn, sRAb, sRAm, sRAn,
+    BM: tl.constexpr, IBN: tl.constexpr, TWO_LEVEL: tl.constexpr,
+    FOLD_TREE: tl.constexpr, BRMt: tl.constexpr,
 ):
     pid_b = tle.program_id(0)
     block_id = tle.program_id(1)
-    Vb = V_local + pid_b * sVb
-    TAUb = TAU_local + pid_b * sTauB + block_id * n
+    # V_local / TAU_local / Qt / Qt2 / Rblocks are internal contiguous buffers
+    # ((B, m, n), (B, num_blocks, n), two (B, *, n) factor stacks and the
+    # (B, num_blocks, n, n) R stack); their strides are derived from the
+    # shapes.  Only Q / Racc strides are passed (caller's out= buffers).
+    Vb = V_local + pid_b * (m * n)
+    TAUb = TAU_local + pid_b * (num_blocks * n) + block_id * n
+    stack_batch = num_blocks * n * n
 
     dt = Vb.dtype.element_ty
     zero = tl.full((), 0.0, dtype=dt)
@@ -586,7 +622,7 @@ def _tsqr_apply_kernel(
     rmask = rm < M
     cmask = cn < n
 
-    Vt = tl.load(Vb + (blk_start + rm)[:, None] * sVm + cn[None, :] * sVn,
+    Vt = tl.load(Vb + (blk_start + rm)[:, None] * n + cn[None, :],
                  mask=rmask[:, None] & cmask[None, :], other=zero)
     tau_vec = tl.load(TAUb + cn, mask=cn < nr, other=zero)
 
@@ -600,9 +636,65 @@ def _tsqr_apply_kernel(
         X = X - vj[:, None] * w[None, :]
 
     cq = tl.arange(0, IBN)
-    Qti = tl.load(Qt + pid_b * sQtb + (block_id * n + cq)[:, None] * sQtm
-                  + cn[None, :] * sQtn,
-                  mask=(cq[:, None] < n) & cmask[None, :], other=zero)
+    if FOLD_TREE:
+        # Redundantly factor the (small) stacked local R's in registers --
+        # same reflector loop as the tree kernel -- and build Q_t locally.
+        rt = tl.arange(0, BRMt)
+        Rm_t = num_blocks * n
+        gmask = rt < Rm_t
+        G = tl.load(Rblocks + pid_b * stack_batch + rt[:, None] * n
+                    + cn[None, :],
+                    mask=gmask[:, None] & cmask[None, :], other=zero)
+        taut = tl.zeros([IBN], dtype=dt)
+        for j in range(n):
+            col_j = tl.sum(tl.where(cn[None, :] == j, G, zero), axis=1)
+            alpha = tl.sum(tl.where(rt == j, col_j, zero))
+            xnorm_sq = tl.sum(tl.where(rt > j, col_j * col_j, zero))
+            norm = tl.sqrt(alpha * alpha + xnorm_sq)
+            beta = tl.where(alpha >= zero, -norm, norm)
+            reflect = xnorm_sq > zero
+            beta_eff = tl.where(reflect, beta, alpha)
+            tau = tl.where(reflect, (beta - alpha) / beta, zero)
+            denom = alpha - beta
+            v_tail = tl.where(reflect, col_j / denom, zero)  # guard 0/0 NaN
+            G = tl.where((rt[:, None] == j) & (cn[None, :] == j), beta_eff, G)
+            G = tl.where((rt[:, None] > j) & (cn[None, :] == j), v_tail[:, None], G)
+            taut = tl.where(cn == j, tau, taut)
+            vj = tl.where(rt > j, v_tail, tl.where(rt == j, one, zero))
+            pmask = cn[None, :] > j
+            w = tau * tl.sum(tl.where(pmask, vj[:, None] * G, zero), axis=0)
+            G = tl.where(pmask, G - vj[:, None] * w[None, :], G)
+        if block_id == 0:
+            R_tile = tl.where(rt[:, None] <= cn[None, :], G, zero)
+            tl.store(Racc + pid_b * sRAb + rt[:, None] * sRAm
+                     + cn[None, :] * sRAn,
+                     R_tile, mask=(rt[:, None] < n) & cmask[None, :])
+        Xt = tl.where(rt[:, None] == cn[None, :], one, zero)
+        for jj in range(n):
+            j = n - 1 - jj
+            v_tail = tl.sum(tl.where(cn[None, :] == j, G, zero), axis=1)
+            vj = tl.where(rt > j, v_tail, tl.where(rt == j, one, zero))
+            tau_j = tl.sum(tl.where(cn == j, taut, zero))
+            w = tau_j * tl.sum(vj[:, None] * Xt, axis=0)
+            Xt = Xt - vj[:, None] * w[None, :]
+        # gather this block's rows of Q_t via a 0/1 selection matmul; rows
+        # beyond n belong to other blocks and must not leak into the output
+        # through X's padded identity columns
+        S = tl.where(rt[None, :] == (block_id * n + cq)[:, None], one, zero)
+        Qti = tl.dot(S, Xt, allow_tf32=False)
+        Qti = tl.where(cq[:, None] < n, Qti, zero)
+    else:
+        Qti = tl.load(Qt + pid_b * stack_batch
+                      + (block_id * n + cq)[:, None] * n + cn[None, :],
+                      mask=(cq[:, None] < n) & cmask[None, :], other=zero)
+    if TWO_LEVEL:
+        # compose with the group rows of the top-level factor first
+        gid = block_id // grp
+        num_groups = (num_blocks + grp - 1) // grp
+        Qt2i = tl.load(Qt2 + pid_b * (num_groups * n * n)
+                       + (gid * n + cq)[:, None] * n + cn[None, :],
+                       mask=(cq[:, None] < n) & cmask[None, :], other=zero)
+        Qti = tl.dot(Qti, Qt2i, allow_tf32=False)
     out = tl.dot(X, Qti, allow_tf32=False)
     tl.store(Q + pid_b * sQb + (blk_start + rm)[:, None] * sQm + cn[None, :] * sQn,
              out, mask=rmask[:, None] & cmask[None, :])
@@ -1477,17 +1569,62 @@ def _tsqr(W, m, n, k, mode, B, out_Q=None, out_R=None):
         num_blocks -= 1
         br = max(n + 1, (m + num_blocks - 1) // num_blocks)
     Rm = num_blocks * n
+    esz = W.element_size()
 
     R_blocks = torch.empty(B, num_blocks, n, n, dtype=dt, device=dev)
     Racc = out_R if out_R is not None else torch.empty(B, n, n, dtype=dt, device=dev)
+
+    # Tree-reduction tiling: the tree kernel has no tl.dot, so its column tile
+    # needs no 16-wide minimum -- padding n=4/8 up to 16 would waste 2-4x of
+    # the register budget on fp64.  Route: a flat single-CTA reduction when
+    # the stack fits the register budget -- except tall fp64 stacks, whose
+    # serial per-reflector tile reductions are so slow in one CTA that a
+    # two-level tree (parallel group reductions + one top reduction, grp
+    # balanced ~sqrt(num_blocks)) wins even when the tile would fit
+    # (empirical on H20: fp64 512x8 flat 279us vs two-level ~40us; fp32 flat
+    # stays faster up to the budget).  Stacks too tall even for the tree go
+    # through the blocked path.  grp (blocks per group) is a power of two so
+    # the padded group tile is exactly grp*IBNt x IBNt.
+    IBNt = triton.next_power_of_2(n)
+    BRM = triton.next_power_of_2(Rm)
+    flat = BRM * IBNt <= red_elem and (esz == 4 or BRM <= _TSQR_TREE_FLAT_ROWS)
+    grp = num_blocks
+    num_groups = 1
+    if not flat:
+        cap = max(1, red_elem // (IBNt * IBNt))  # group-tile budget, in blocks
+        cap = 1 << (cap.bit_length() - 1)  # round down to a power of two
+        g = 1
+        while g * g < num_blocks:
+            g <<= 1
+        grp = min(g, cap)
+        num_groups = (num_blocks + grp - 1) // grp
+        while grp < num_blocks \
+                and triton.next_power_of_2(num_groups * n) * IBNt > red_elem:
+            grp <<= 1
+            num_groups = (num_blocks + grp - 1) // grp
+        two_level = num_groups > 1 and grp <= cap \
+            and triton.next_power_of_2(num_groups * n) * IBNt <= red_elem
+    else:
+        two_level = False
+    use_tree = flat or two_level
+    # Fold the tree reduction into the apply kernel for small fp32 stacks:
+    # every CTA redundantly factors the stacked R's in registers (a few tiny
+    # reflector steps), saving a whole kernel launch + the Q_t round-trip.
+    # fp64 is excluded: its register-tile reductions are ~10x slower, so the
+    # redundant per-CTA factorisation costs more than the saved launch.
+    BRMt = max(16, triton.next_power_of_2(Rm))
+    fold = flat and write_Q and esz == 4 and BRMt * IBN <= _TSQR_FOLD_ELEM
+
     if write_Q:
         Q = out_Q if out_Q is not None else torch.empty(B, m, n, dtype=dt, device=dev)
         V_local = torch.empty(B, m, n, dtype=dt, device=dev)
         TAU_local = torch.empty(B, num_blocks, n, dtype=dt, device=dev)
-        Qt = torch.empty(B, Rm, n, dtype=dt, device=dev)
+        Qt = Racc if fold else torch.empty(B, Rm, n, dtype=dt, device=dev)
+        Qt2 = torch.empty(B, num_groups * n, n, dtype=dt, device=dev) if two_level \
+            else Qt
     else:
         # dummy pointers, never read or written (STORE_V / write_Q are False)
-        Q = Qt = V_local = TAU_local = torch.empty(B, 1, 1, dtype=dt, device=dev)
+        Q = Qt = Qt2 = V_local = TAU_local = torch.empty(B, 1, 1, dtype=dt, device=dev)
 
     # ---- Phase 1: local QR of all row blocks in one launch ----
     # W is read-only here -- the caller's input is never scribbled on.
@@ -1504,22 +1641,40 @@ def _tsqr(W, m, n, k, mode, B, out_Q=None, out_R=None):
     )
 
     # ---- Phase 2: tree reduction of the stacked local R factors ----
-    BRM = triton.next_power_of_2(Rm)
-    if BRM * IBN <= red_elem:
-        # stack fits one register-resident CTA per batch: factor + build Q_t
-        _tsqr_tree_kernel[(B,)](
-            R_blocks, Racc, Qt, n, num_blocks, write_Q,
-            R_blocks.stride(0), R_blocks.stride(2), R_blocks.stride(3),
-            Racc.stride(0), Racc.stride(1), Racc.stride(2),
-            Qt.stride(0), Qt.stride(1), Qt.stride(2),
-            BRM=BRM, IBN=IBN,
-            num_warps=_TSQR_TREE_WARPS,
-        )
+    def tree_warps(tile_rows):
+        return _TSQR_TREE_WARPS if tile_rows * IBNt * esz <= 16384 else 8
+
+    if use_tree:
+        if fold:
+            pass  # the apply kernel factors the stack redundantly per CTA
+        elif two_level:
+            Rg = torch.empty(B, num_groups, n, n, dtype=dt, device=dev)
+            _tsqr_tree_kernel[(B, num_groups)](
+                R_blocks, Rg, Qt, n, num_blocks, grp, write_Q,
+                Rg.stride(0), Rg.stride(2), Rg.stride(3),
+                BRM=grp * IBNt, IBN=IBNt,
+                num_warps=tree_warps(grp * IBNt),
+            )
+            BRMt2 = triton.next_power_of_2(num_groups * n)
+            _tsqr_tree_kernel[(B, 1)](
+                Rg, Racc, Qt2, n, num_groups, num_groups, write_Q,
+                Racc.stride(0), Racc.stride(1), Racc.stride(2),
+                BRM=BRMt2, IBN=IBNt,
+                num_warps=tree_warps(BRMt2),
+            )
+        else:
+            # stack fits one register-resident CTA per batch: factor + build Q_t
+            _tsqr_tree_kernel[(B, 1)](
+                R_blocks, Racc, Qt, n, num_blocks, num_blocks, write_Q,
+                Racc.stride(0), Racc.stride(1), Racc.stride(2),
+                BRM=BRM, IBN=IBNt,
+                num_warps=tree_warps(BRM),
+            )
     else:
-        # Stack too tall for one CTA: factor it with the blocked path (the
-        # mcta panels handle any height) and assemble Q_t from its reflectors.
-        # R_blocks is dead after this, so the blocked kernels may factor it in
-        # place (Rstack is a view).
+        # Stack too tall even for a two-level tree: factor it with the blocked
+        # path (the mcta panels handle any height) and assemble Q_t from its
+        # reflectors.  R_blocks is dead after this, so the blocked kernels may
+        # factor it in place (Rstack is a view).
         Rstack = R_blocks.reshape(B, Rm, n)
         Vt = torch.zeros(B, Rm, n, dtype=dt, device=dev) if write_Q \
             else torch.empty(B, Rm, n, dtype=dt, device=dev)
@@ -1529,17 +1684,19 @@ def _tsqr(W, m, n, k, mode, B, out_Q=None, out_R=None):
         _triu_copy(Rstack, Racc, n, n, B)
         if write_Q:
             _assemble_q(Vt, tau_t, Tbuf_t, Rm, n, n, n, _PANEL_IB, B, Qt)
+        two_level = False
 
     if not write_Q:
         return None, Racc
 
     # ---- Phase 3: Q[block rows] = Q_local @ Q_t[block rows], one CTA/block ----
     _tsqr_apply_kernel[(B, num_blocks)](
-        V_local, TAU_local, Qt, Q, m, n, br, k_max,
-        sVb, sVm, sVn, TAU_local.stride(0),
-        Qt.stride(0), Qt.stride(1), Qt.stride(2),
+        V_local, TAU_local, Qt, Qt2, Q, R_blocks, Racc,
+        m, n, br, k_max, grp, num_blocks,
         Q.stride(0), Q.stride(1), Q.stride(2),
-        BM=BM, IBN=IBN,
+        Racc.stride(0), Racc.stride(1), Racc.stride(2),
+        BM=BM, IBN=IBN, TWO_LEVEL=two_level,
+        FOLD_TREE=fold, BRMt=BRMt if fold else 16,
         num_warps=max(4, min(16, (BM * IBN) // 4096)),
     )
     return Q, Racc
