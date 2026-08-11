@@ -39,11 +39,20 @@ QR_SHAPES = [
     (4096, 4),
     (3, 8),
     (8, 32),
+    (8, 2048),
     (64, 256),
     (2, 8, 8),
     (3, 13, 7),
     (4, 7, 13),
     (2, 4, 4, 4),
+    # regression: partial last panel on the multi-CTA path used to index the
+    # sync scratch with kk // ib_active (out of bounds) and corrupt memory
+    (2048, 1030),
+    (4096, 1000),
+    # regression: wide-n tall matrices must take the blocked path (TSQR legacy
+    # kernels are only safe for narrow n)
+    (4096, 128),
+    (4096, 1024),
 ]
 
 QR_MODES = ["reduced", "complete", "r"]
@@ -168,3 +177,65 @@ def test_linalg_qr_invalid_mode():
     with pytest.raises(ValueError):
         with flag_gems.use_gems():
             torch.linalg.qr(inp, mode="nonsense")
+
+
+@pytest.mark.linalg_qr
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (64, 32),      # fused path
+        (512, 512),    # blocked path
+        (2048, 1030),  # blocked, multi-CTA panels + partial last panel
+        (16384, 64),   # TSQR legacy (multi-CTA local kernel)
+    ],
+)
+@pytest.mark.parametrize("dtype", _TEST_DTYPES)
+def test_linalg_qr_input_not_mutated(shape, dtype):
+    """linalg_qr must not modify its input tensor (matches torch.linalg.qr).
+
+    The blocked path factors a clone, but the TSQR legacy multi-CTA local
+    kernel used to write R into the input's own storage.
+    """
+    if dtype == torch.float64 and not utils.fp64_is_supported:
+        pytest.skip("fp64 is not supported on this device")
+    inp = torch.randn(shape, dtype=dtype, device=DEVICE)
+    orig = inp.clone()
+
+    with flag_gems.use_gems():
+        torch.linalg.qr(inp, mode="reduced")
+
+    assert torch.equal(inp, orig)
+
+
+@pytest.mark.linalg_qr
+@pytest.mark.parametrize("shape", [(64, 32), (256, 128), (600, 64)])
+@pytest.mark.parametrize("dtype", _TEST_DTYPES)
+def test_linalg_qr_zero_column(shape, dtype):
+    """Inputs with an exact zero column must not produce NaN.
+
+    A zero column has a zero Householder tail norm (tau == 0); an unguarded
+    0/0 reflector tail used to leak NaN into the fused kernel's Q assembly.
+    R row signs are arbitrary for a zero diagonal, so this checks
+    reconstruction and orthonormality instead of R equality.
+    """
+    if dtype == torch.float64 and not utils.fp64_is_supported:
+        pytest.skip("fp64 is not supported on this device")
+    inp = torch.randn(shape, dtype=dtype, device=DEVICE)
+    inp[..., 1] = 0
+
+    with flag_gems.use_gems():
+        res_Q, res_R = torch.linalg.qr(inp, mode="reduced")
+
+    assert not torch.isnan(res_Q).any() and not torch.isnan(res_R).any()
+    torch.backends.cuda.matmul.allow_tf32 = False
+    k = min(shape[-2], shape[-1])
+    utils.gems_assert_close(
+        res_Q @ res_R, utils.to_reference(inp), dtype, reduce_dim=k
+    )
+    gram = res_Q.transpose(-1, -2) @ res_Q
+    eye = torch.eye(res_Q.shape[-1], dtype=res_Q.dtype, device=res_Q.device)
+    utils.gems_assert_close(
+        gram, utils.to_reference(eye), dtype, reduce_dim=res_Q.shape[-1]
+    )
+    zeros = utils.to_reference(torch.zeros_like(res_R))
+    utils.gems_assert_close(res_R.tril(-1), zeros, dtype)
