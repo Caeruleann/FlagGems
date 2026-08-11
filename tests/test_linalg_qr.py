@@ -111,9 +111,6 @@ def _assert_qr_valid(res_Q, res_R, ref_Q, ref_R, mode, dtype):
 def test_linalg_qr(shape, dtype, mode):
     if dtype == torch.float64 and not utils.fp64_is_supported:
         pytest.skip("fp64 is not supported on this device")
-    if mode == "complete" and shape[-2] < shape[-1]:
-        pytest.skip("complete mode requires m >= n")
-
     inp = torch.randn(shape, dtype=dtype, device=DEVICE)
     ref_inp = utils.to_reference(inp)
 
@@ -131,8 +128,6 @@ def test_linalg_qr(shape, dtype, mode):
 def test_linalg_qr_out(shape, dtype, mode):
     if dtype == torch.float64 and not utils.fp64_is_supported:
         pytest.skip("fp64 is not supported on this device")
-    if mode == "complete" and shape[-2] < shape[-1]:
-        pytest.skip("complete mode requires m >= n")
 
     inp = torch.randn(shape, dtype=dtype, device=DEVICE)
     ref_inp = utils.to_reference(inp)
@@ -186,15 +181,15 @@ def test_linalg_qr_invalid_mode():
         (64, 32),      # fused path
         (512, 512),    # blocked path
         (2048, 1030),  # blocked, multi-CTA panels + partial last panel
-        (16384, 64),   # TSQR legacy (multi-CTA local kernel)
+        (16384, 64),   # TSQR path (local + tree/apply pipeline)
     ],
 )
 @pytest.mark.parametrize("dtype", _TEST_DTYPES)
 def test_linalg_qr_input_not_mutated(shape, dtype):
     """linalg_qr must not modify its input tensor (matches torch.linalg.qr).
 
-    The blocked path factors a clone, but the TSQR legacy multi-CTA local
-    kernel used to write R into the input's own storage.
+    The blocked path factors a clone, but the TSQR local kernel used to
+    write R into the input's own storage.
     """
     if dtype == torch.float64 and not utils.fp64_is_supported:
         pytest.skip("fp64 is not supported on this device")
@@ -239,3 +234,114 @@ def test_linalg_qr_zero_column(shape, dtype):
     )
     zeros = utils.to_reference(torch.zeros_like(res_R))
     utils.gems_assert_close(res_R.tril(-1), zeros, dtype)
+
+
+@pytest.mark.linalg_qr
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (64, 32),      # fused path
+        (256, 128),    # blocked path (small)
+        (512, 512),    # blocked path
+        (2048, 1030),  # blocked, multi-CTA panels
+        (1024, 16),    # TSQR path
+        (8192, 8),     # TSQR path
+    ],
+)
+@pytest.mark.parametrize("kind", ["zero_col", "dup_col", "rank1"])
+@pytest.mark.parametrize("dtype", _TEST_DTYPES)
+def test_linalg_qr_rank_deficient(shape, kind, dtype):
+    """Exactly rank-deficient inputs must give a valid factorisation (no NaN).
+
+    R is not unique for rank-deficient inputs, so this checks the
+    factorisation properties (reconstruction, orthonormal Q, triangular R)
+    rather than equality with torch's R.
+    """
+    if dtype == torch.float64 and not utils.fp64_is_supported:
+        pytest.skip("fp64 is not supported on this device")
+    m, n = shape
+    inp = torch.randn(shape, dtype=dtype, device=DEVICE)
+    if kind == "zero_col":
+        inp[..., n // 2] = 0
+    elif kind == "dup_col":
+        inp[..., -1] = inp[..., 0] * 2
+        inp[..., n // 2] = inp[..., 1] - inp[..., 0]
+    else:
+        inp = (
+            torch.randn(m, 1, dtype=dtype, device=DEVICE)
+            @ torch.randn(1, n, dtype=dtype, device=DEVICE)
+        )
+
+    with flag_gems.use_gems():
+        res_Q, res_R = torch.linalg.qr(inp, mode="reduced")
+
+    assert not torch.isnan(res_Q).any() and not torch.isnan(res_R).any()
+    torch.backends.cuda.matmul.allow_tf32 = False
+    k = min(m, n)
+    utils.gems_assert_close(
+        res_Q @ res_R, utils.to_reference(inp), dtype, reduce_dim=k
+    )
+    gram = res_Q.transpose(-1, -2) @ res_Q
+    eye = torch.eye(res_Q.shape[-1], dtype=res_Q.dtype, device=res_Q.device)
+    utils.gems_assert_close(
+        gram, utils.to_reference(eye), dtype, reduce_dim=res_Q.shape[-1]
+    )
+    zeros = utils.to_reference(torch.zeros_like(res_R))
+    utils.gems_assert_close(res_R.tril(-1), zeros, dtype)
+
+
+@pytest.mark.linalg_qr
+@pytest.mark.parametrize("shape", [(0, 0), (5, 0), (0, 5), (2, 0, 4)])
+@pytest.mark.parametrize("mode", QR_MODES)
+def test_linalg_qr_empty(shape, mode):
+    """Degenerate (zero-size) inputs return torch-compatible empty factors."""
+    inp = torch.randn(shape, device=DEVICE)
+
+    ref_Q, ref_R = torch.linalg.qr(inp, mode=mode)
+    with flag_gems.use_gems():
+        res_Q, res_R = torch.linalg.qr(inp, mode=mode)
+
+    assert res_Q.shape == ref_Q.shape
+    assert res_R.shape == ref_R.shape
+    if mode == "complete" and res_Q.numel() > 0:
+        eye = torch.eye(res_Q.shape[-1], device=DEVICE).expand_as(res_Q)
+        assert torch.equal(res_Q, eye)
+
+
+@pytest.mark.linalg_qr
+@pytest.mark.parametrize("shape", [(256, 64), (64, 512), (4, 128, 32)])
+@pytest.mark.parametrize("dtype", _TEST_DTYPES)
+def test_linalg_qr_transposed_input(shape, dtype):
+    """Transposed views (non-contiguous, swapped strides) must work."""
+    if dtype == torch.float64 and not utils.fp64_is_supported:
+        pytest.skip("fp64 is not supported on this device")
+    full = torch.randn(
+        shape[:-2] + (shape[-1], shape[-2]), dtype=dtype, device=DEVICE
+    )
+    inp = full.transpose(-1, -2)
+    assert not inp.is_contiguous()
+    ref_inp = utils.to_reference(inp)
+
+    ref_Q, ref_R = torch.linalg.qr(ref_inp)
+    with flag_gems.use_gems():
+        res_Q, res_R = torch.linalg.qr(inp)
+
+    _assert_qr_valid(res_Q, res_R, ref_Q, ref_R, "reduced", dtype)
+
+
+@pytest.mark.linalg_qr
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.float16, torch.bfloat16])
+def test_linalg_qr_unsupported_dtype(dtype):
+    """Unsupported dtypes raise NotImplementedError (not a wrong result)."""
+    inp = torch.randn(8, 8, device=DEVICE).to(dtype)
+    with pytest.raises(NotImplementedError):
+        with flag_gems.use_gems():
+            torch.linalg.qr(inp)
+
+
+@pytest.mark.linalg_qr
+def test_linalg_qr_dim_lt_2():
+    inp = torch.randn(8, device=DEVICE)
+    with pytest.raises(RuntimeError):
+        with flag_gems.use_gems():
+            torch.linalg.qr(inp)

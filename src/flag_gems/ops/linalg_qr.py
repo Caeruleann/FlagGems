@@ -1589,6 +1589,25 @@ def linalg_qr(A, mode="reduced", *, out=None):
     for d in batch_shape:
         B *= d
 
+    if m == 0 or n == 0:
+        # Degenerate input: no factorisation to run.  torch.linalg.qr returns
+        # empty factors, except complete mode with zero columns where Q = I.
+        if mode == "r":
+            q_shape, r_shape = (0,), (*batch_shape, k, n)
+        elif mode == "reduced":
+            q_shape, r_shape = (*batch_shape, m, k), (*batch_shape, k, n)
+        else:
+            q_shape, r_shape = (*batch_shape, m, m), (*batch_shape, m, n)
+        if out is not None:
+            Q, R = out
+        else:
+            Q = A.new_empty(q_shape)
+            R = A.new_empty(r_shape)
+        if mode == "complete" and n == 0 and m > 0:
+            eye = torch.eye(m, dtype=A.dtype, device=A.device)
+            Q.copy_(eye.expand(*batch_shape, m, m))
+        return Q, R
+
     # Read-only view of A.  The fused path and the TSQR register-resident path
     # never write W (kernels only read it), so no copy is needed there; the
     # mutating paths (blocked / multi-CTA TSQR) clone below.
