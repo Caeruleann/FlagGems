@@ -31,6 +31,11 @@ def _gems_qr_out(A, out=None, mode="reduced"):
 # Shapes come from the linalg_qr / linalg_qr_out entries in core_shapes.yaml.
 QR_MODES = ["reduced", "complete", "r"]
 
+# fp64 is only benchmarked on backends that support it.
+QR_DTYPES = [torch.float32]
+if flag_gems.runtime.device.support_fp64:
+    QR_DTYPES.append(torch.float64)
+
 
 def _qr_out_shapes(shape, mode):
     """Output (Q, R) shapes of torch.linalg.qr's out= variant per mode."""
@@ -87,7 +92,7 @@ def test_linalg_qr(mode):
         input_fn=_make_qr_input_fn(mode),
         torch_op=torch.ops.aten.linalg_qr,
         gems_op=flag_gems.linalg_qr,
-        dtypes=[torch.float32, torch.float64],
+        dtypes=QR_DTYPES,
     )
     bench.run()
 
@@ -100,6 +105,6 @@ def test_linalg_qr_out(mode):
         input_fn=_make_qr_out_input_fn(mode),
         torch_op=torch.linalg.qr,
         gems_op=_gems_qr_out,
-        dtypes=[torch.float32, torch.float64],
+        dtypes=QR_DTYPES,
     )
     bench.run()

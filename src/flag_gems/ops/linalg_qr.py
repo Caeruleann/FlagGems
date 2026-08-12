@@ -182,9 +182,12 @@ def _geqrt_kernel(
     col_idx = tl.arange(0, IBN)
     num_tiles = (M + RM - 1) // RM
 
+    # tau and the R diagonal accumulate in registers and are flushed with one
+    # vector store each after the loop -- 0-d scalar stores are unreliable on
+    # some vendor backends
+    tau_arr = tl.zeros([IBN], dtype=dt)
+    rdg = tl.zeros([IBN], dtype=dt)
     for j in range(nr):
-        pivot = kk + j
-
         # ---- pass A: pivot alpha + tail norm --------------------------------
         alpha = zero
         xnorm_sq = zero
@@ -203,9 +206,12 @@ def _geqrt_kernel(
         beta_eff = tl.where(reflect, beta, alpha)
         tau = tl.where(reflect, (beta - alpha) / beta, zero)
         denom = alpha - beta
+        # guard 0/0: without a reflection denom may be 0; keep the tail
+        # quotient finite before the reflect mask discards it
+        denom_safe = tl.where(reflect, denom, one)
 
-        tl.store(TAUb + (kk + j) * sTauN, tau)
-        tl.store(Wb + pivot * sWm + (kk + j) * sWn, beta_eff)
+        tau_arr = tl.where(col_idx == j, tau, tau_arr)
+        rdg = tl.where(col_idx == j, beta_eff, rdg)
 
         # ---- pass B: store Householder vector (explicit unit lower) ---------
         for t in range(num_tiles):
@@ -213,7 +219,7 @@ def _geqrt_kernel(
             rows_g = kk + local
             rmask = local < M
             col = tl.load(Wb + rows_g * sWm + (kk + j) * sWn, mask=rmask, other=zero)
-            v_tail = col / denom
+            v_tail = col / denom_safe
             v = tl.where(local > j, v_tail, tl.where(local == j, one, zero))
             v = tl.where(reflect, v, tl.where(local == j, one, zero))
             tl.store(Vb + rows_g * sVm + (kk + j) * sVn, v, mask=rmask)
@@ -249,6 +255,11 @@ def _geqrt_kernel(
             tl.store(Wb + wblock_off, Wt, mask=smask)
         tl.debug_barrier()
 
+    # flush tau and the R diagonal with one vector store each
+    tl.store(TAUb + (kk + col_idx) * sTauN, tau_arr, mask=col_idx < nr)
+    tl.store(Wb + (kk + col_idx) * sWm + (kk + col_idx) * sWn, rdg,
+             mask=col_idx < nr)
+
 
 # ===========================================================================
 # Kernel 2: multi-CTA panel factorisation (row-split across NC CTAs).
@@ -260,8 +271,11 @@ def _geqrt_kernel(
 # ===========================================================================
 @triton.jit
 def _barrier(ctr, off, NC):
-    tl.atomic_add(ctr + off, 1)
-    while tl.load(ctr + off, volatile=True) < NC:
+    # release: prior partial-sum atomics are visible before the count lands;
+    # acquire spin: volatile alone does NOT order the post-barrier loads on
+    # weak-memory backends -- an atomic acquire read does.
+    tl.atomic_add(ctr + off, 1, sem="release")
+    while tl.atomic_add(ctr + off, 0, sem="acquire") < NC:
         pass
 
 
@@ -302,6 +316,10 @@ def _geqrt_mcta_kernel(
         cmask = col_idx < ib
         Wblk = tl.load(Wb + gr[:, None] * sWm + (kk + col_idx)[None, :] * sWn,
                        mask=rmask[:, None] & cmask[None, :], other=zero)
+        # tau accumulates in registers and is flushed with ONE vector store
+        # after the loop -- 0-d scalar stores are unreliable on some vendor
+        # backends
+        tau_arr = tl.zeros([IBN], dtype=dt)
         for j in range(nr):
             # column j from the sustained panel chunk
             col_j = tl.sum(tl.where(col_idx[None, :] == j, Wblk, zero), axis=1)
@@ -337,17 +355,21 @@ def _geqrt_mcta_kernel(
             beta_eff = tl.where(reflect, beta, alpha)
             tau = tl.where(reflect, (beta - alpha) / beta, zero)
             denom = alpha - beta
-            tl.store(TAUb + (kk + j) * sTauN, tau)
+            # guard 0/0: without a reflection denom may be 0 and the tail /
+            # fix-up quotients would go non-finite before the reflect mask
+            # discards them -- keep them finite on any FP backend
+            denom_safe = tl.where(reflect, denom, one)
+            tau_arr = tl.where(col_idx == j, tau, tau_arr)
             # V from col_j -> global V buffer
-            v_tail = col_j / denom
+            v_tail = col_j / denom_safe
             v = tl.where(plr > j, v_tail, tl.where(plr == j, one, zero))
             v = tl.where(reflect, v, tl.where(plr == j, one, zero))
             tl.store(Vb + gr * sVm + (kk + j) * sVn, v, mask=rmask)
             # write R diagonal into the sustained chunk (owning CTA only)
             diag = (lr[:, None] == (j - row_lo)) & (col_idx[None, :] == j)
             Wblk = tl.where(diag, beta_eff, Wblk)
-            # scalar fix-up of the pre-barrier partials (denom != 0 when reflect)
-            w = tl.where(reflect, tau * (rowj + wraw / denom), zero)
+            # scalar fix-up of the pre-barrier partials (denom_safe != 0 always)
+            w = tl.where(reflect, tau * (rowj + wraw / denom_safe), zero)
             # in-place trailing update of the sustained chunk
             upd = v[:, None] * w[None, :]
             upd = tl.where(wmask, upd, zero)
@@ -355,11 +377,18 @@ def _geqrt_mcta_kernel(
         # flush the sustained panel chunk once (upper triangle now holds R)
         tl.store(Wb + gr[:, None] * sWm + (kk + col_idx)[None, :] * sWn, Wblk,
                  mask=rmask[:, None] & cmask[None, :])
+        # flush tau with one vector store
+        tl.store(TAUb + (kk + col_idx) * sTauN, tau_arr, mask=col_idx < nr)
     else:
         # General path (CHUNK > RM, very tall panels): tile loop per pass.
         # Same single-barrier scheme as the fast path: accumulate the unscaled
         # w partials (wraw / rowj) together with alpha/xnorm in ONE tile loop,
         # barrier once, then fix up with the tau/denom scalars.
+        # tau and the R diagonal accumulate in registers and are flushed with
+        # one vector store each after the loop -- 0-d scalar stores are
+        # unreliable on some vendor backends
+        tau_arr = tl.zeros([IBN], dtype=dt)
+        rdg = tl.zeros([IBN], dtype=dt)
         for j in range(nr):
             alpha_c = zero
             xnorm_c = zero
@@ -398,10 +427,12 @@ def _geqrt_mcta_kernel(
             beta_eff = tl.where(reflect, beta, alpha)
             tau = tl.where(reflect, (beta - alpha) / beta, zero)
             denom = alpha - beta
-            tl.store(TAUb + (kk + j) * sTauN, tau)
-            tl.store(Wb + (kk + j) * sWm + (kk + j) * sWn, beta_eff)
-            # scalar fix-up of the pre-barrier partials (denom != 0 when reflect)
-            w = tl.where(reflect, tau * (rowj + wraw / denom), zero)
+            # guard 0/0: see the fast path above
+            denom_safe = tl.where(reflect, denom, one)
+            tau_arr = tl.where(col_idx == j, tau, tau_arr)
+            rdg = tl.where(col_idx == j, beta_eff, rdg)
+            # scalar fix-up of the pre-barrier partials (denom_safe != 0 always)
+            w = tl.where(reflect, tau * (rowj + wraw / denom_safe), zero)
 
             for t in range(NUM_TILES):
                 lr = t * RM + rows_local
@@ -411,7 +442,7 @@ def _geqrt_mcta_kernel(
                 wblk = tl.load(Wb + gr[:, None] * sWm + (kk + col_idx)[None, :] * sWn,
                                mask=rmask[:, None] & (col_idx[None, :] < ib), other=zero)
                 col = tl.sum(tl.where(col_idx[None, :] == j, wblk, zero), axis=1)
-                v_tail = col / denom
+                v_tail = col / denom_safe
                 v = tl.where(plr > j, v_tail, tl.where(plr == j, one, zero))
                 v = tl.where(reflect, v, tl.where(plr == j, one, zero))
                 tl.store(Vb + gr * sVm + (kk + j) * sVn, v, mask=rmask)
@@ -421,6 +452,10 @@ def _geqrt_mcta_kernel(
                 tl.store(Wb + gr[:, None] * sWm + (kk + col_idx)[None, :] * sWn, wblk,
                          mask=rmask[:, None] & wmask[None, :])
             tl.debug_barrier()
+        # flush tau and the R diagonal with one vector store each
+        tl.store(TAUb + (kk + col_idx) * sTauN, tau_arr, mask=col_idx < nr)
+        tl.store(Wb + (kk + col_idx) * sWm + (kk + col_idx) * sWn, rdg,
+                 mask=col_idx < nr)
 
 
 # ===========================================================================
@@ -827,6 +862,9 @@ def _geqrt_sram_kernel(
     A = tl.load(Wb + rows_g[:, None] * sWm + cols_g[None, :] * sWn,
                 mask=rmask[:, None] & cmask[None, :], other=zero)
 
+    # tau accumulates in registers and is flushed with ONE vector store after
+    # the loop -- 0-d scalar stores are unreliable on some vendor backends
+    tau_arr = tl.zeros([IBN], dtype=dt)
     for j in range(ib):
         col_j = tl.sum(tl.where(cn[None, :] == j, A, zero), axis=1)
         alpha = tl.sum(tl.where(rm == j, col_j, zero))
@@ -842,7 +880,7 @@ def _geqrt_sram_kernel(
         A = tl.where((rm[:, None] == j) & (cn[None, :] == j), beta_eff, A)
         A = tl.where((rm[:, None] > j) & (cn[None, :] == j), v_tail[:, None], A)
         # write tau
-        tl.store(TAUb + (kk + j) * sTauN, tau)
+        tau_arr = tl.where(cn == j, tau, tau_arr)
         # write Householder vector vj (0/<j, 1/==j, tail/>j) to the V buffer
         vj = tl.where(rm > j, v_tail, tl.where(rm == j, one, zero))
         vj = tl.where(reflect, vj, tl.where(rm == j, one, zero))
@@ -851,6 +889,9 @@ def _geqrt_sram_kernel(
         pmask = cn[None, :] > j
         w = tau * tl.sum(tl.where(pmask, vj[:, None] * A, zero), axis=0)
         A = tl.where(pmask, A - vj[:, None] * w[None, :], A)
+
+    # flush tau with one vector store
+    tl.store(TAUb + (kk + cn) * sTauN, tau_arr, mask=cmask)
 
     # write the panel back to W (upper triangle holds R; strict-lower holds the
     # reflector tails, harmless -- _triu_copy only reads the upper triangle)
@@ -900,6 +941,8 @@ def _larft_kernel(
     Tb = MOUT + pid * sMb
 
     dt = Vb.dtype.element_ty
+    zero = tl.full((), 0.0, dtype=dt)
+    one = tl.full((), 1.0, dtype=dt)
     idx = tl.arange(0, IBN)  # row/col index 0..IBN-1
     num_tiles = (M + RM - 1) // RM
 
@@ -917,24 +960,37 @@ def _larft_kernel(
 
     # ---- M = T^{-1} = triu(G, 1) + diag(1/tau)  (upper triangular) ----
     tau_vec = tl.load(TAUb + idx * sTauN, mask=idx < ib, other=1.0)
-    inv_tau = 1.0 / tau_vec
+    # tau == 0 (rank-deficient panel) makes the reflector the identity; its
+    # T row must come out exactly zero.  Put +inf on M's diagonal explicitly
+    # instead of relying on 1/0, so the reciprocal-based solve in larfb (fp64
+    # path) yields that zero row on any floating-point backend.
+    inv_tau = tl.where(tau_vec != 0.0, 1.0 / tau_vec, float("inf"))
     Mmat = tl.where(idx[:, None] < idx[None, :], G, 0.0)
     Mmat = tl.where(idx[:, None] == idx[None, :], inv_tau[:, None], Mmat)
 
     Tmat = tl.zeros((IBN, IBN), dtype=dt)
     if INVERT:
-        # ---- invert M -> T by back-substitution (rows ib-1 .. 0) ----
-        for jj in tl.static_range(0, IBN):
-            i = IBN - 1 - jj
-            if i < ib:
-                Mrow = tl.sum(tl.where(idx[:, None] == i, Mmat, 0.0), axis=0)
-                Mii = tl.sum(tl.where(idx == i, Mrow, 0.0))
-                contrib = tl.sum(
-                    tl.where(idx[:, None] > i, Mrow[:, None] * Tmat, 0.0), axis=0
-                )
-                Trow = -contrib / Mii
-                Trow = tl.where(idx == i, 1.0 / Mii, Trow)
-                Tmat = tl.where(idx[:, None] == i, Trow[None, :], Tmat)
+        # ---- invert M -> T via the nilpotent (Neumann) product ----
+        # M = D(I + N) with D = diag(M), N = D^{-1} U strictly upper, hence
+        # N^IBN == 0 and
+        #   T = M^{-1} = (I + N)^{-1} D^{-1}
+        #   = (I + X)(I + X^2)(I + X^4)... D^{-1},   X = -N.
+        # Plain GEMMs only: the serial masked-reduction back-substitution this
+        # replaces was flaky on vendor backends with weak cross-warp sync.
+        # dinv = 1/M_ii comes out division-free: M_ii = 1/tau (resp. +inf for
+        # tau == 0), so dinv = tau (resp. 0) -- the zero-tau T row is exactly
+        # zero, as with the old reciprocal scheme.
+        dinv = tl.where(tau_vec != 0.0, tau_vec, zero)
+        U = tl.where(idx[:, None] < idx[None, :], Mmat, zero)
+        X = -U * dinv[:, None]  # N = D^{-1} U: ROW scaling
+        eye = tl.where(idx[:, None] == idx[None, :], one, zero)
+        S = eye + X
+        # 5 squarings cover IBN <= 64 (S then holds the full series through
+        # X^63); extra iterations are no-ops once X is nilpotent-zero.
+        for _ in range(5):
+            X = tl.dot(X, X, allow_tf32=False)
+            S = tl.dot(S, eye + X, allow_tf32=False)
+        Tmat = S * dinv[None, :]  # T = S D^{-1}: COLUMN scaling
     out = Tmat if INVERT else Mmat
 
     # ---- store T (INVERT) or M = T^{-1} (upper triangular) ----
@@ -994,7 +1050,7 @@ def _larfb_kernel(
     Y = tl.zeros((IBN, TN), dtype=dt)
     if SOLVE:
         if UPPER:
-            for jj in tl.static_range(0, IBN):
+            for jj in range(IBN):
                 i = IBN - 1 - jj
                 if i < ib:
                     Mrow = tl.sum(tl.where(col_idx[:, None] == i, Msram, 0.0), axis=0)
@@ -1003,10 +1059,11 @@ def _larfb_kernel(
                     contrib = tl.sum(
                         tl.where(col_idx[:, None] > i, Mrow[:, None] * Y, 0.0), axis=0
                     )
-                    Yrow = (W1row - contrib) / Mii
+                    # *reciprocal: zero-tau -> Mii=+inf -> exact zero row
+                    Yrow = (W1row - contrib) * (1.0 / Mii)
                     Y = tl.where(col_idx[:, None] == i, Yrow[None, :], Y)
         else:
-            for i in tl.static_range(0, IBN):
+            for i in range(IBN):
                 if i < ib:
                     Mcol = tl.sum(tl.where(col_idx[None, :] == i, Msram, 0.0), axis=1)
                     W1row = tl.sum(tl.where(col_idx[:, None] == i, W1, 0.0), axis=0)
@@ -1014,7 +1071,8 @@ def _larfb_kernel(
                     contrib = tl.sum(
                         tl.where(col_idx[:, None] < i, Mcol[:, None] * Y, 0.0), axis=0
                     )
-                    Yrow = (W1row - contrib) / Mii
+                    # *reciprocal: zero-tau -> Mii=+inf -> exact zero row
+                    Yrow = (W1row - contrib) * (1.0 / Mii)
                     Y = tl.where(col_idx[:, None] == i, Yrow[None, :], Y)
     else:
         Tsram = Msram
@@ -1135,6 +1193,10 @@ def _assemble_q_fused_kernel(
         qt = tl.where(rmask[:, None] & pmask[None, :], qt, zero)
         tl.store(Qb + rows[:, None] * sQm + p_idx[None, :] * sQn, qt,
                  mask=rmask[:, None] & pmask[None, :])
+    # The panel loop below reads back what this loop just wrote (and each
+    # panel iteration reads what the previous one stored): cross-thread
+    # global write->read within a CTA is unordered without a barrier.
+    tl.debug_barrier()
 
     # apply panels in reverse: Q <- H_p Q
     for pp in range(P - 1, -1, -1):
@@ -1172,6 +1234,8 @@ def _assemble_q_fused_kernel(
             Qt = tl.load(Qb + q_off, mask=rmask[:, None] & pmask[None, :], other=zero)
             Qt = Qt - tl.dot(Vt, Y, allow_tf32=False)
             tl.store(Qb + q_off, Qt, mask=rmask[:, None] & pmask[None, :])
+        # next panel's W1 accumulation reads the tiles just stored
+        tl.debug_barrier()
 
 
 # ===========================================================================

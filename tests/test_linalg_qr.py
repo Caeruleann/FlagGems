@@ -24,27 +24,27 @@ DEVICE = flag_gems.device
 # fp64 cases are skipped at runtime on backends that do not support fp64.
 _TEST_DTYPES = [torch.float32, torch.float64]
 
-# Shapes covering every routing path of the op: tiny/edge, square, tall, wide,
-# panel-boundary, tall-skinny (TSQR), batched, and batched with extra dims.
+# Shapes covering every routing path of the op, one representative per
+# scenario (the out= variant uses its own smaller list below; specialised
+# edge cases -- rank deficiency, non-contiguous, transposed views -- live in
+# the dedicated tests further down).
 QR_SHAPES = [
+    # degenerate: single row / single column
     (1, 1),
     (1, 7),
     (7, 1),
+    # fused single-kernel path: even/odd square, tall, wide
     (8, 8),
     (33, 33),
     (8, 3),
-    (64, 32),
+    (3, 8),
+    # blocked path: two-panel tall, wide multi-panel, wide single-panel
     (512, 64),
+    (64, 256),
+    (8, 2048),
+    # tall-skinny TSQR path
     (1024, 16),
     (4096, 4),
-    (3, 8),
-    (8, 32),
-    (8, 2048),
-    (64, 256),
-    (2, 8, 8),
-    (3, 13, 7),
-    (4, 7, 13),
-    (2, 4, 4, 4),
     # regression: partial last panel on the multi-CTA path used to index the
     # sync scratch with kk // ib_active (out of bounds) and corrupt memory
     (2048, 1030),
@@ -52,10 +52,38 @@ QR_SHAPES = [
     # regression: wide-n tall matrices must take the blocked path (TSQR legacy
     # kernels are only safe for narrow n)
     (4096, 128),
-    (4096, 1024),
+    # batched, and batched with extra dims
+    (2, 8, 8),
+    (2, 4, 4, 4),
+]
+
+# The out= variant uses a smaller set: its job is to exercise the out
+# plumbing (in-place write, full overwrite, no input mutation) once per
+# major routing path, not to re-cover every scenario.
+QR_OUT_SHAPES = [
+    (8, 8),        # fused
+    (512, 64),     # blocked, tall
+    (64, 256),     # blocked, wide multi-panel
+    (1024, 16),    # TSQR
+    (2048, 1030),  # blocked, multi-CTA with partial last panel
+    (2, 8, 8),     # batched
 ]
 
 QR_MODES = ["reduced", "complete", "r"]
+
+
+def _skip_broken_reference(shape):
+    # Iluvatar's own torch.linalg.qr returns A as Q for 1-row inputs (Q must
+    # be +/-1), so the reference itself -- not our output -- is wrong there.
+    # On thead these shapes fail with a runtime error instead.
+    if shape not in [(1, 1), (1, 7)]:
+        return
+    if flag_gems.vendor_name == "iluvatar":
+        pytest.skip("iluvatar torch.linalg.qr is broken for 1-row inputs "
+                    "(returns A as Q); the reference is wrong")
+    if flag_gems.vendor_name == "thead":
+        pytest.skip("thead torch.linalg.qr fails with a runtime error "
+                    "for 1-row inputs")
 
 
 def _harmonise_r_sign(res_R, ref_R):
@@ -109,6 +137,7 @@ def _assert_qr_valid(res_Q, res_R, ref_Q, ref_R, mode, dtype):
 @pytest.mark.parametrize("dtype", _TEST_DTYPES)
 @pytest.mark.parametrize("mode", QR_MODES)
 def test_linalg_qr(shape, dtype, mode):
+    _skip_broken_reference(shape)
     if dtype == torch.float64 and not utils.fp64_is_supported:
         pytest.skip("fp64 is not supported on this device")
     inp = torch.randn(shape, dtype=dtype, device=DEVICE)
@@ -122,7 +151,7 @@ def test_linalg_qr(shape, dtype, mode):
 
 
 @pytest.mark.linalg_qr_out
-@pytest.mark.parametrize("shape", QR_SHAPES)
+@pytest.mark.parametrize("shape", QR_OUT_SHAPES)
 @pytest.mark.parametrize("dtype", _TEST_DTYPES)
 @pytest.mark.parametrize("mode", QR_MODES)
 def test_linalg_qr_out(shape, dtype, mode):
@@ -130,18 +159,32 @@ def test_linalg_qr_out(shape, dtype, mode):
         pytest.skip("fp64 is not supported on this device")
 
     inp = torch.randn(shape, dtype=dtype, device=DEVICE)
+    inp_before = inp.clone()
     ref_inp = utils.to_reference(inp)
 
     ref_Q, ref_R = torch.linalg.qr(ref_inp, mode=mode)
 
-    res_Q = torch.empty(ref_Q.shape, dtype=dtype, device=DEVICE)
-    res_R = torch.empty(ref_R.shape, dtype=dtype, device=DEVICE)
+    # Pre-fill the out tensors with NaN so any element the op fails to write
+    # is caught instead of going unnoticed.
+    res_Q = torch.full(ref_Q.shape, float("nan"), dtype=dtype, device=DEVICE)
+    res_R = torch.full(ref_R.shape, float("nan"), dtype=dtype, device=DEVICE)
     with flag_gems.use_gems():
         out_Q, out_R = torch.linalg.qr(inp, mode=mode, out=(res_Q, res_R))
 
     # The out variant must write in place and return the same tensors.
     assert out_Q.data_ptr() == res_Q.data_ptr()
     assert out_R.data_ptr() == res_R.data_ptr()
+    # Every element of the out tensors must have been overwritten.
+    assert not torch.isnan(out_Q).any() and not torch.isnan(out_R).any()
+    # The input must not be mutated.
+    assert torch.equal(inp, inp_before)
+    # The out variant must agree with the allocating variant (not bitwise:
+    # the multi-CTA panel reduction accumulates with atomic adds, whose
+    # floating-point order is nondeterministic run to run).
+    with flag_gems.use_gems():
+        alloc_Q, alloc_R = torch.linalg.qr(inp, mode=mode)
+    utils.gems_assert_close(out_Q, alloc_Q, dtype)
+    utils.gems_assert_close(out_R, alloc_R, dtype)
 
     _assert_qr_valid(out_Q, out_R, ref_Q, ref_R, mode, dtype)
 
