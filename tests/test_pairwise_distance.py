@@ -33,7 +33,11 @@ _ASCEND_SUPPORTED_P = (0.0, 1.0, 2.0)
 def _ref_pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
     # On ascend backend, native pairwise_distance only supports p in {0, 1, 2}.
     # Fall back to composed op for unsupported p values.
-    if flag_gems.vendor_name == "ascend" and not cfg.TO_CPU and p not in _ASCEND_SUPPORTED_P:
+    if (
+        flag_gems.vendor_name == "ascend"
+        and not cfg.TO_CPU
+        and p not in _ASCEND_SUPPORTED_P
+    ):
         return composed_pairwise_distance(x1, x2, p=p, eps=eps, keepdim=keepdim)
     # On iluvatar, CPU-mode torch.pairwise_distance precision does not match
     # the device-side implementation. Use composed op when TO_CPU is enabled.
