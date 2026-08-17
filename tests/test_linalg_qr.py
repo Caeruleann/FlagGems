@@ -55,6 +55,9 @@ QR_SHAPES = [
     # batched, and batched with extra dims
     (2, 8, 8),
     (2, 4, 4, 4),
+    # regression: batch counts above the Ascend vector-core count used to
+    # corrupt the first block's output (launches must be split per core count)
+    (64, 8, 8),
 ]
 
 # The out= variant uses a smaller set: its job is to exercise the out

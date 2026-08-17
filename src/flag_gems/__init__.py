@@ -397,7 +397,11 @@ _FULL_CONFIG = (
     ("embedding", embedding),
     ("embedding_backward", embedding_backward),
     ("embedding_dense_backward", embedding_dense_backward),
-    ("empty.memory_format", empty),
+    # TODO(master): re-enable once the zero-element-grid launch crash is
+    # picked up from master -- torch.empty((0,)) under use_gems() fails with
+    # rtKernelLaunch on Ascend because the intercepted kernel launches a
+    # 0-size grid.
+    # ("empty.memory_format", empty),
     ("eq.Scalar", eq_scalar),
     ("eq.Tensor", eq),
     ("eq_.Scalar", eq_scalar_),
