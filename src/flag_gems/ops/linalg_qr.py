@@ -1777,13 +1777,11 @@ def _validate_mode(mode):
 
 
 def linalg_qr(A, mode="reduced", *, out=None):
-    """Compute the QR decomposition of ``A``, matching ``torch.linalg.qr``.
-
-    If ``out=(Q, R)`` is given the factors are written directly into those
-    caller-owned buffers (no internal allocation / copy of the outputs) -- this
-    is the path used by ``linalg_qr_out`` / ``torch.linalg.qr(A, out=...)``.
-    """
     logger.debug("GEMS LINALG_QR")
+    return _linalg_qr(A, mode, out=out)
+
+
+def _linalg_qr(A, mode="reduced", *, out=None):
     _validate_mode(mode)
 
     if A.dim() < 2:
@@ -1893,10 +1891,5 @@ def linalg_qr(A, mode="reduced", *, out=None):
 
 
 def linalg_qr_out(A, mode="reduced", *, Q, R):
-    """``out=`` variant of :func:`linalg_qr` (matches ``aten::linalg_qr.out``).
-
-    Writes the factors directly into the caller-provided ``Q`` / ``R`` tensors
-    (no internal allocation / copy) and returns them.
-    """
     logger.debug("GEMS LINALG_QR_OUT")
-    return linalg_qr(A, mode, out=(Q, R))
+    return _linalg_qr(A, mode, out=(Q, R))

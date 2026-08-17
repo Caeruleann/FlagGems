@@ -25,7 +25,7 @@ from flag_gems.ops.linalg_qr import (
     _launch_larft,
     _triu_copy,
 )
-from flag_gems.ops.linalg_qr import linalg_qr as _generic_linalg_qr
+from flag_gems.ops.linalg_qr import _linalg_qr as _generic_linalg_qr
 
 logger = logging.getLogger(__name__)
 
@@ -121,13 +121,18 @@ def _linalg_qr_blocked_safe(A, mode, out=None):
     return Q.reshape(*batch_shape, m, m), R.reshape(*batch_shape, m, n)
 
 
-def linalg_qr(A, mode="reduced", *, out=None):
-    logger.debug("GEMS LINALG_QR")
+def _linalg_qr_impl(A, mode, out=None):
+    """Routing shared by linalg_qr / linalg_qr_out (no logging)."""
     if _use_safe_q_assembly(A, mode):
         return _linalg_qr_blocked_safe(A, mode, out=out)
     return _generic_linalg_qr(A, mode, out=out)
 
 
+def linalg_qr(A, mode="reduced", *, out=None):
+    logger.debug("GEMS_ILUVATAR LINALG_QR")
+    return _linalg_qr_impl(A, mode, out=out)
+
+
 def linalg_qr_out(A, mode="reduced", *, Q, R):
-    logger.debug("GEMS LINALG_QR_OUT")
-    return linalg_qr(A, mode, out=(Q, R))
+    logger.debug("GEMS_ILUVATAR LINALG_QR_OUT")
+    return _linalg_qr_impl(A, mode, out=(Q, R))

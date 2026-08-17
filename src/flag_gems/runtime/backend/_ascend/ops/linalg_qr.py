@@ -1187,8 +1187,7 @@ def _ascend_linalg_qr(A, mode, out=None):
     return (Q.reshape(*batch_shape, m, m), R.reshape(*batch_shape, m, n))
 
 
-def linalg_qr(A, mode="reduced", *, out=None):
-    logger.debug("GEMS_ASCEND LINALG_QR")
+def _linalg_qr(A, mode="reduced", *, out=None):
     if mode not in ("reduced", "complete", "r"):
         raise ValueError(
             f"linalg_qr: mode must be one of 'reduced', 'complete', 'r', got {mode!r}"
@@ -1202,7 +1201,10 @@ def linalg_qr(A, mode="reduced", *, out=None):
         )
     return _ascend_linalg_qr(A, mode, out=out)
 
+def linalg_qr(A, mode="reduced", *, out=None):
+    logger.debug("GEMS_ASCEND LINALG_QR")
+    return _linalg_qr(A, mode=mode, out=out)
 
 def linalg_qr_out(A, mode="reduced", *, Q, R):
     logger.debug("GEMS_ASCEND LINALG_QR_OUT")
-    return linalg_qr(A, mode, out=(Q, R))
+    return _linalg_qr(A, mode, out=(Q, R))

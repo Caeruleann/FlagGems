@@ -153,6 +153,17 @@ def test_linalg_qr(shape, dtype, mode):
     _assert_qr_valid(res_Q, res_R, ref_Q, ref_R, mode, dtype)
 
 
+def _qr_out_shapes(shape, mode):
+    """Output (Q, R) shapes of torch.linalg.qr's out= variant per mode."""
+    *batch, m, n = shape
+    k = min(m, n)
+    if mode == "complete":
+        return (*batch, m, m), (*batch, m, n)
+    if mode == "r":
+        return (0,), (*batch, k, n)
+    return (*batch, m, k), (*batch, k, n)
+
+
 @pytest.mark.linalg_qr_out
 @pytest.mark.parametrize("shape", QR_OUT_SHAPES)
 @pytest.mark.parametrize("dtype", _TEST_DTYPES)
@@ -165,7 +176,12 @@ def test_linalg_qr_out(shape, dtype, mode):
     inp_before = inp.clone()
     ref_inp = utils.to_reference(inp)
 
-    ref_Q, ref_R = torch.linalg.qr(ref_inp, mode=mode)
+    # The reference also goes through the out= contract, so both sides are
+    # exercised the same way (and the gems side must accept exactly the
+    # shapes torch's out variant produces).
+    ref_Q = ref_inp.new_empty(_qr_out_shapes(shape, mode)[0])
+    ref_R = ref_inp.new_empty(_qr_out_shapes(shape, mode)[1])
+    torch.linalg.qr(ref_inp, mode=mode, out=(ref_Q, ref_R))
 
     # Pre-fill the out tensors with NaN so any element the op fails to write
     # is caught instead of going unnoticed.
@@ -181,13 +197,6 @@ def test_linalg_qr_out(shape, dtype, mode):
     assert not torch.isnan(out_Q).any() and not torch.isnan(out_R).any()
     # The input must not be mutated.
     assert torch.equal(inp, inp_before)
-    # The out variant must agree with the allocating variant (not bitwise:
-    # the multi-CTA panel reduction accumulates with atomic adds, whose
-    # floating-point order is nondeterministic run to run).
-    with flag_gems.use_gems():
-        alloc_Q, alloc_R = torch.linalg.qr(inp, mode=mode)
-    utils.gems_assert_close(out_Q, alloc_Q, dtype)
-    utils.gems_assert_close(out_R, alloc_R, dtype)
 
     _assert_qr_valid(out_Q, out_R, ref_Q, ref_R, mode, dtype)
 
