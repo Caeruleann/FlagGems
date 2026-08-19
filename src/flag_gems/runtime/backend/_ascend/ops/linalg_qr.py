@@ -329,6 +329,10 @@ def _panel_mcta_kernel(
     cols = tl.arange(0, PW)
     cmask = cols < nb
     cnt = base
+    # dep carries a dependency on the last barrier's spin result into the
+    # panel loads (always 0, see the barrier comment below); initialised
+    # here so it is loop-carried across reflectors.
+    dep = tl.minimum(base, 0)
 
     for jj in range(nb):
         j = j0 + jj
@@ -336,21 +340,30 @@ def _panel_mcta_kernel(
         Vcol = Vb + j * ld
 
         # band partials for alpha / xnorm of column j
-        col = tl.load(Wcol + rows, mask=rmask, other=zero)
+        col = tl.load(Wcol + rows + dep, mask=rmask, other=zero)
         pa = tl.sum((rmask & (rows == j)) * col)
         px = tl.sum((rmask & (rows > j)) * col * col)
         tl.store(abuf + j * nc + pid_c, pa)
         tl.store(xbuf + j * nc + pid_c, px)
         tl.atomic_add(ctr, 1, sem="release")
-        while tl.atomic_add(ctr, 0, sem="acquire") < cnt + nc:
-            pass
+        # Barrier spin: an atomic inside the spin loop segfaults CANN 9.0.0's
+        # bishengir-compile, so poll with a volatile load; the loop-free
+        # acquire atomic below restores the read-side ordering.  The loads
+        # of barrier-protected buffers must depend on the spin result (via
+        # dep, always 0): otherwise the 9.0.0 compiler hoists them above
+        # the spin loop and reads stale partials.
+        cw = tl.load(ctr, volatile=True)
+        while cw < cnt + nc:
+            cw = tl.load(ctr, volatile=True)
+        tl.atomic_add(ctr, 0, sem="acquire")
         cnt += nc
+        dep = tl.minimum(cw - cnt, 0)
 
         alpha = zero
         xnorm_sq = zero
         for q in range(nc):
-            alpha += tl.load(abuf + j * nc + q)
-            xnorm_sq += tl.load(xbuf + j * nc + q)
+            alpha += tl.load(abuf + j * nc + q + dep)
+            xnorm_sq += tl.load(xbuf + j * nc + q + dep)
 
         norm = tl.sqrt(alpha * alpha + xnorm_sq)
         beta = tl.where(alpha >= zero, -norm, norm)
@@ -373,20 +386,23 @@ def _panel_mcta_kernel(
 
         # within-panel apply: band partial of w = v^T X_panel
         x = tl.load(
-            Wb + (j0 + cols)[None, :] * ld + rows[:, None],
+            Wb + (j0 + cols)[None, :] * ld + rows[:, None] + dep,
             mask=rmask[:, None] & cmask[None, :],
             other=zero,
         )
         pw = tl.sum(v[:, None] * x, axis=0)
         tl.store(wbuf + (jj * nc + pid_c) * PW + cols, pw, mask=cmask)
         tl.atomic_add(ctr, 1, sem="release")
-        while tl.atomic_add(ctr, 0, sem="acquire") < cnt + nc:
-            pass
+        cw = tl.load(ctr, volatile=True)
+        while cw < cnt + nc:
+            cw = tl.load(ctr, volatile=True)
+        tl.atomic_add(ctr, 0, sem="acquire")
         cnt += nc
+        dep = tl.minimum(cw - cnt, 0)
 
         w = tl.zeros((PW,), dtype=dt)
         for q in range(nc):
-            w += tl.load(wbuf + (jj * nc + q) * PW + cols, mask=cmask, other=zero)
+            w += tl.load(wbuf + (jj * nc + q) * PW + cols + dep, mask=cmask, other=zero)
         w = tau * w * cmask * (cols > jj)
         x = x - v[:, None] * w[None, :]
         tl.store(
@@ -395,9 +411,12 @@ def _panel_mcta_kernel(
             mask=rmask[:, None] & cmask[None, :],
         )
         tl.atomic_add(ctr, 1, sem="release")
-        while tl.atomic_add(ctr, 0, sem="acquire") < cnt + nc:
-            pass
+        cw = tl.load(ctr, volatile=True)
+        while cw < cnt + nc:
+            cw = tl.load(ctr, volatile=True)
+        tl.atomic_add(ctr, 0, sem="acquire")
         cnt += nc
+        dep = tl.minimum(cw - cnt, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -893,7 +912,13 @@ def _reg_tile_cfg(m, n, qcols):
     # results for e.g. 128x64), so wider matrices fall through to the
     # staged paths.
     if m <= 128 and tn_n <= 32:
-        return (128, min(32, tn_n), min(qc, 32))
+        tq = min(qc, 32)
+        # complete mode needs all qcols Q columns in the register tile;
+        # wider than the TQ cap they would never be written (a 128x128
+        # loop-carried tile overflows the UB), so use the staged paths
+        if qcols > tq:
+            return None
+        return (128, min(32, tn_n), tq)
     return None
 
 
