@@ -1183,10 +1183,9 @@ def _ascend_linalg_qr(A, mode, out=None):
                 if l2_mcta:
                     for b0, bn in _batch_chunks(B):
                         W2s, Rs = _bslice((Wc2, R), b0, bn)
-                        _triu_copy_cm[
-                            (bn, _grid_elem(n, 64), _grid_elem(n, _TN))
-                        ](W2s, Rs, n, n, ld2, n * ld2, sRb, sRm, sRn,
-                          TM=64, TN=_TN)
+                        _triu_copy_cm[(bn, _grid_elem(n, 64), _grid_elem(n, _TN))](
+                            W2s, Rs, n, n, ld2, n * ld2, sRb, sRm, sRn, TM=64, TN=_TN
+                        )
                 Q = (
                     out_Q
                     if out_Q is not None
@@ -1250,8 +1249,8 @@ def _ascend_linalg_qr(A, mode, out=None):
                 for b0, bn in _batch_chunks(B):
                     W2s, Rs = _bslice((Wc2, R), b0, bn)
                     _triu_copy_cm[(bn, _grid_elem(n, 64), _grid_elem(n, _TN))](
-                        W2s, Rs, n, n, ld2, n * ld2, sRb, sRm, sRn,
-                        TM=64, TN=_TN)
+                        W2s, Rs, n, n, ld2, n * ld2, sRb, sRm, sRn, TM=64, TN=_TN
+                    )
             return (Q.reshape(*batch_shape, m, n), R.reshape(*batch_shape, n, n))
 
         reg = None
