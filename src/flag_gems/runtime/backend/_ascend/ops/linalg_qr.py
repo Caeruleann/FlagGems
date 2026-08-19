@@ -282,9 +282,7 @@ def _panel_kernel(
 # spin barrier, so the work and the bandwidth scale with the band count.
 # Slot-based partials keep the result deterministic (no floating-point
 # atomics).  Three barriers per reflector: partials written -> sums/apply
-# done -> apply visible for the next reduce.  WRITE_R (TSQR final level):
-# band 0 additionally writes the n x n upper triangle to R -- n <= 64, so
-# every R row lives in band 0's own slice and no extra barrier is needed.
+# done -> apply visible for the next reduce.
 #
 # The barrier counter must start at zero for every call and live in its own
 # allocation (a counter embedded in a shape-dependent workspace gets
@@ -300,7 +298,6 @@ def _panel_mcta_kernel(
     XBUF,
     WBUF,
     CTR,
-    R,
     m,
     j0,
     nb,
@@ -311,12 +308,8 @@ def _panel_mcta_kernel(
     sVb,
     sTauB,
     sTauN,
-    sRb,
-    sRm,
-    sRn,
     RM: tl.constexpr,
     PW: tl.constexpr,
-    WRITE_R: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_c = tl.program_id(1)
@@ -405,21 +398,6 @@ def _panel_mcta_kernel(
         while tl.atomic_add(ctr, 0, sem="acquire") < cnt + nc:
             pass
         cnt += nc
-
-    if WRITE_R:
-        # TSQR final level (j0 == 0, nb == n <= 64): R's rows all live in
-        # band 0's 64-row slice, which only band 0 writes, so after its own
-        # loop its rows are final -- no extra barrier needed.
-        if pid_c == 0:
-            rr = tl.arange(0, 64)
-            rc = tl.arange(0, 64)
-            rmask2 = (rr < nb)[:, None] & (rc < nb)[None, :]
-            rv = tl.load(Wb + rc[None, :] * ld + rr[:, None], mask=rmask2, other=zero)
-            tl.store(
-                R + pid_b * sRb + rr[:, None] * sRm + rc[None, :] * sRn,
-                rv * (rr[:, None] <= rc[None, :]),
-                mask=rmask2,
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -1156,8 +1134,9 @@ def _ascend_linalg_qr(A, mode, out=None):
                 ].view(B, 64 * nc2, 64)
                 # fresh zeroed barrier counters per call (start at 0)
                 ct2 = torch.zeros(B, dtype=torch.int32, device=A.device)
-                # WRITE_R: the panel kernel writes the n x n triangle to R
-                # itself, saving a separate copy-out launch
+                # no in-kernel R write here: an R-writer tail on this kernel
+                # segfaults bishengir-compile on CANN 9.0.0 (CI), so this
+                # branch keeps the separate triu copy-out below
                 _panel_mcta_kernel[(B, nc2)](
                     Wc2,
                     Vc2,
@@ -1166,7 +1145,6 @@ def _ascend_linalg_qr(A, mode, out=None):
                     xb2,
                     wb2,
                     ct2,
-                    R,
                     m2,
                     0,
                     n,
@@ -1177,12 +1155,8 @@ def _ascend_linalg_qr(A, mode, out=None):
                     n * ld2,
                     n,
                     1,
-                    sRb,
-                    sRm,
-                    sRn,
                     RM=64,
                     PW=64,
-                    WRITE_R=True,
                 )
             else:
                 _panel_kernel[(B,)](
@@ -1206,6 +1180,13 @@ def _ascend_linalg_qr(A, mode, out=None):
                     WRITE_R=True,
                 )
             if mode == "r":
+                if l2_mcta:
+                    for b0, bn in _batch_chunks(B):
+                        W2s, Rs = _bslice((Wc2, R), b0, bn)
+                        _triu_copy_cm[
+                            (bn, _grid_elem(n, 64), _grid_elem(n, _TN))
+                        ](W2s, Rs, n, n, ld2, n * ld2, sRb, sRm, sRn,
+                          TM=64, TN=_TN)
                 Q = (
                     out_Q
                     if out_Q is not None
@@ -1214,9 +1195,9 @@ def _ascend_linalg_qr(A, mode, out=None):
                 return Q, R.reshape(*batch_shape, n, n)
 
             # Q assembly through the chain, innermost first: with l2_reg the
-            # register kernel has already written Q2 (Xs[-1]) and R; the panel
-            # path still needs Q2 built from the panel factors (R was already
-            # written by the panel kernels above).
+            # register kernel has already written Q2 (Xs[-1]) and R; the
+            # single-CTA panel has written R via WRITE_R; the mcta panel
+            # still needs the separate triu copy-out below.
             Q = (
                 out_Q
                 if out_Q is not None
@@ -1265,6 +1246,12 @@ def _ascend_linalg_qr(A, mode, out=None):
                         RM=mp,
                         TQ=tn1,
                     )
+            if l2_mcta:
+                for b0, bn in _batch_chunks(B):
+                    W2s, Rs = _bslice((Wc2, R), b0, bn)
+                    _triu_copy_cm[(bn, _grid_elem(n, 64), _grid_elem(n, _TN))](
+                        W2s, Rs, n, n, ld2, n * ld2, sRb, sRm, sRn,
+                        TM=64, TN=_TN)
             return (Q.reshape(*batch_shape, m, n), R.reshape(*batch_shape, n, n))
 
         reg = None
@@ -1389,7 +1376,6 @@ def _ascend_linalg_qr(A, mode, out=None):
                         xbs_,
                         wbs_,
                         cs_,
-                        Ws_,
                         m,
                         j0,
                         nb,
@@ -1400,12 +1386,8 @@ def _ascend_linalg_qr(A, mode, out=None):
                         sVb,
                         sTauB,
                         sTauN,
-                        0,
-                        0,
-                        0,
                         RM=64,
                         PW=64,
-                        WRITE_R=False,
                     )
                     cbase += 3 * nb * nc
                 else:
