@@ -1506,6 +1506,37 @@ ops:
       - Reduction
     stages:
       - stable: '5.0'
+  - id: binary_cross_entropy
+    description: |
+      Measures the binary cross entropy between the target and input probabilities,
+      with optional per-element weighting.
+    for:
+      - binary_cross_entropy
+    labels:
+      - aten
+      - pointwise
+      - nn.functional
+      - KernelGen
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: binary_cross_entropy_out
+    description: |
+      The out variant of binary_cross_entropy. Measures the binary cross entropy
+      between the target and input probabilities and writes the result to the
+      provided output tensor.
+    for:
+      - binary_cross_entropy_out
+    labels:
+      - aten
+      - pointwise
+      - nn.functional
+      - KernelGen
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: bitwise_and_scalar
     description: Computes the bitwise AND of `input` and `other` scalar.
     for:
@@ -2699,6 +2730,17 @@ ops:
       - LinearAlg
     stages:
       - stable: '1.0'
+  - id: cumsum_
+    description: In-place version of cumsum.
+    for:
+      - cumsum_
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - Reduction
+    stages:
+      - alpha: '5.4'
   - id: cumsum_out
     destination: |
       Returns the cumulative sum of elements of `input` in the dimension `dim`.
@@ -3493,6 +3535,17 @@ ops:
       - Math
     stages:
       - alpha: '5.4'
+  - id: expand_copy
+    description: Returns a copy of the input tensor expanded by broadcasting singleton dimensions.
+    for:
+      - expand_copy
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - Math
+    stages:
+      - alpha: '5.4'
   - id: expm1
     description: Computes the exponential of the elements minus 1 of `input`.
     for:
@@ -4112,6 +4165,17 @@ ops:
       Computes the gradient of fractional_max_pool2d.
     for:
       - fractional_max_pool2d_backward
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - Math
+    stages:
+      - alpha: '5.4'
+  - id: frexp
+    description: Return mantissa and exponent of input, such that x = mantissa * 2^exponent, with mantissa in (-1, 1).
+    for:
+      - frexp
     labels:
       - aten
       - KernelGen
@@ -5971,6 +6035,32 @@ ops:
       tensors for in-place writing.
     for:
       - linalg.lu_factor_ex.out
+    labels:
+      - aten
+    kind:
+      - Math
+    stages:
+      - alpha: '5.4'
+  - id: linalg_lu
+    description: |
+      Computes the LU factorization with partial pivoting of a matrix and
+      returns the permutation matrix P and the lower/upper triangular factors
+      L and U such that P @ L @ U = A (or L @ U = A for pivot=False).
+    for:
+      - linalg.lu
+    labels:
+      - aten
+    kind:
+      - Math
+    stages:
+      - alpha: '5.4'
+  - id: linalg_lu_out
+    description: |
+      Out-of-place version of linalg_lu. Supports calling
+      torch.linalg.lu(A, *, pivot=True, out=(P, L, U)). The out parameter
+      provides pre-allocated output tensors for in-place writing.
+    for:
+      - linalg.lu.out
     labels:
       - aten
     kind:

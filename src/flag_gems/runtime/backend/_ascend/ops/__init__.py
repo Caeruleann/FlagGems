@@ -59,6 +59,7 @@ from .layernorm import layer_norm, native_layer_norm
 from .linalg_cross import linalg_cross, linalg_cross_out
 from .linalg_det import linalg_det, linalg_det_out
 from .linalg_lstsq import linalg_lstsq
+from .linalg_lu import linalg_lu, linalg_lu_out
 from .linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
 from .linalg_lu_factor_ex import linalg_lu_factor_ex, linalg_lu_factor_ex_out
 from .linalg_qr import linalg_qr, linalg_qr_out
@@ -181,10 +182,12 @@ __all__ = [
     "linalg_det",
     "linalg_det_out",
     "linalg_lstsq",
+    "linalg_lu",
     "linalg_lu_factor",
     "linalg_lu_factor_ex",
     "linalg_lu_factor_ex_out",
     "linalg_lu_factor_out",
+    "linalg_lu_out",
     "linalg_qr",
     "linalg_qr_out",
     "linspace",
