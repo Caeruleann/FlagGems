@@ -271,12 +271,11 @@ def _geqrt_kernel(
 # ===========================================================================
 @triton.jit
 def _barrier(ctr, off, NC):
-    # release: prior partial-sum atomics are visible before the count lands;
-    # acquire spin: volatile alone does NOT order the post-barrier loads on
-    # weak-memory backends -- an atomic acquire read does.
+    # release: prior partial-sum atomics are visible before the count lands.
     tl.atomic_add(ctr + off, 1, sem="release")
-    while tl.atomic_add(ctr + off, 0, sem="acquire") < NC:
+    while tl.load(ctr + off, volatile=True) < NC:
         pass
+    tl.atomic_add(ctr + off, 0, sem="acquire")
 
 
 @libentry()
