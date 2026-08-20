@@ -2106,12 +2106,10 @@ def _linalg_qr_mx(A, mode="reduced", *, out=None):
 
 
 def linalg_qr(A, mode="reduced", *, out=None):
-    """Compute the QR decomposition of ``A`` (metax backend override)."""
-    logger.debug("GEMS LINALG_QR (metax)")
+    logger.debug("GEMS_METAX LINALG_QR")
     return _linalg_qr_mx(A, mode, out=out)
 
 
 def linalg_qr_out(A, mode="reduced", *, Q, R):
-    """``out=`` variant of :func:`linalg_qr` (metax backend override)."""
-    logger.debug("GEMS LINALG_QR_OUT (metax)")
+    logger.debug("GEMS_METAX LINALG_QR_OUT")
     return _linalg_qr_mx(A, mode, out=(Q, R))
