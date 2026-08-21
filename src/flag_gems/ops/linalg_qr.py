@@ -273,9 +273,13 @@ def _geqrt_kernel(
 def _barrier(ctr, off, NC):
     # release: prior partial-sum atomics are visible before the count lands.
     tl.atomic_add(ctr + off, 1, sem="release")
-    while tl.load(ctr + off, volatile=True) < NC:
+    # Spin read via an atomic with the DEFAULT memory order (acq_rel).  The
+    # two alternatives are both broken on some vendor backend: a volatile
+    # load spin never observes the count on hygon, and an atomic with an
+    # explicit sem= kwarg in the spin hangs the thead PPU fork.  acq_rel is
+    # a superset of the acquire ordering the barrier-protected loads need.
+    while tl.atomic_add(ctr + off, 0) < NC:
         pass
-    tl.atomic_add(ctr + off, 0, sem="acquire")
 
 
 @libentry()
