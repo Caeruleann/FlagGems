@@ -190,7 +190,6 @@ def _larft_kernel_mx(
 @triton.jit
 def _larfb_kernel_mx(
     V,
-    TAU,
     TOUT,
     C,
     M,
@@ -199,8 +198,6 @@ def _larfb_kernel_mx(
     sVb,
     sVm,
     sVn,
-    sTauB,
-    sTauN,
     sTb,
     sTm,
     sTn,
@@ -1013,7 +1010,6 @@ def _launch_geqrt_mcta_mx(
     rowj_buf,
     ctr,
     m,
-    n,
     k,
     kk,
     ib,
@@ -1029,7 +1025,6 @@ def _launch_geqrt_mcta_mx(
     nr = min(ib, k - kk)
     CHUNK = (M + NC - 1) // NC
     NUM_TILES = (CHUNK + rm - 1) // rm
-    NSYNC = 2
     sWb, sWm, sWn = W.stride()
     sVb, sVm, sVn = V.stride()
     sTauB, sTauN = tau.stride()
@@ -1050,8 +1045,6 @@ def _launch_geqrt_mcta_mx(
         M,
         kk,
         ib,
-        n,
-        k,
         nr,
         p,
         sWb,
@@ -1078,7 +1071,6 @@ def _launch_geqrt_mcta_mx(
         RM=rm,
         IBN=max(16, triton.next_power_of_2(ib)),
         NC=NC,
-        NSYNC=NSYNC,
         NUM_TILES=NUM_TILES,
         num_warps=_MCTA_WARPS,
     )
@@ -1122,7 +1114,7 @@ def _bcast_ch(ibn, other):
     return max(1, min(8, _BCAST_ELEM // (ibn * max(other, 1))))
 
 
-def _launch_larft_mx(V, tau, Tout, m, kk, ib, B, warps=None):
+def _launch_larft_mx(V, tau, Tout, m, kk, ib, B):
     M = m - kk
     sVb, sVm, sVn = V.stride()
     sTauB, sTauN = tau.stride()
@@ -1145,7 +1137,7 @@ def _launch_larft_mx(V, tau, Tout, m, kk, ib, B, warps=None):
                 GRAN=_PAR_GRAN,
                 IBN=ibn,
                 CH=_bcast_ch(ibn, ibn),
-                num_warps=_LARFT_WARPS if warps is None else warps,
+                num_warps=_LARFT_WARPS,
                 num_stages=1,
             )
             _larft_finalize_kernel_mx[(B,)](
@@ -1161,7 +1153,7 @@ def _launch_larft_mx(V, tau, Tout, m, kk, ib, B, warps=None):
                 sTm,
                 sTn,
                 IBN=ibn,
-                num_warps=_LARFT_WARPS if warps is None else warps,
+                num_warps=_LARFT_WARPS,
                 num_stages=1,
             )
             return
@@ -1182,7 +1174,7 @@ def _launch_larft_mx(V, tau, Tout, m, kk, ib, B, warps=None):
             RM=_PANEL_RM,
             IBN=ibn,
             CH=_bcast_ch(ibn, ibn),
-            num_warps=_LARFT_WARPS if warps is None else warps,
+            num_warps=_LARFT_WARPS,
             # explicit pipeliner depth: defensive against the default-depth
             # miscompiles this backend shows on load-loop kernels (proven for
             # the fp32 larfb, see _launch_larfb_mx); correctness-neutral here
@@ -1206,13 +1198,12 @@ def _launch_larft_mx(V, tau, Tout, m, kk, ib, B, warps=None):
             RM=_PANEL_RM,
             IBN=max(16, triton.next_power_of_2(ib)),
             INVERT=True,
-            num_warps=_LARFT_WARPS if warps is None else warps,
+            num_warps=_LARFT_WARPS,
         )
 
 
-def _launch_larfb_mx(V, tau, Tp, C, m, p, ib, B, upper):
+def _launch_larfb_mx(V, Tp, C, m, p, ib, B, upper):
     sVb, sVm, sVn = V.stride()
-    sTauB, sTauN = tau.stride()
     sTb, sTm, sTn = Tp.stride()
     sCb, sCm, sCn = C.stride()
     # fp32 trailing tile width: TN=16 wins on narrow trailing updates (r-mode
@@ -1309,7 +1300,6 @@ def _launch_larfb_mx(V, tau, Tp, C, m, p, ib, B, upper):
             return
         _larfb_kernel_mx[(B, grid_p)](
             V,
-            tau,
             Tp,
             C,
             m,
@@ -1318,8 +1308,6 @@ def _launch_larfb_mx(V, tau, Tp, C, m, p, ib, B, upper):
             sVb,
             sVm,
             sVn,
-            sTauB,
-            sTauN,
             sTb,
             sTm,
             sTn,
@@ -1338,7 +1326,6 @@ def _launch_larfb_mx(V, tau, Tp, C, m, p, ib, B, upper):
     else:
         _larfb_kernel[(B, grid_p)](
             V,
-            tau,
             Tp,
             C,
             m,
@@ -1347,8 +1334,6 @@ def _launch_larfb_mx(V, tau, Tp, C, m, p, ib, B, upper):
             sVb,
             sVm,
             sVn,
-            sTauB,
-            sTauN,
             sTb,
             sTm,
             sTn,
@@ -1527,13 +1512,12 @@ def _blocked_qr_mx(W, V, tau, Tbuf, m, n, k, ib=None):
     needs_mcta = any(
         triton.next_power_of_2(m - kk) > sram_max_m for kk in range(0, k, ib)
     )
-    NSYNC = 2
     if needs_mcta:
         alpha_buf = torch.zeros(B, P, ib, dtype=dt, device=dev)
         xnorm_buf = torch.zeros(B, P, ib, dtype=dt, device=dev)
         w_sum = torch.zeros(B, P, ib, ib, dtype=dt, device=dev)
         rowj_buf = torch.zeros(B, P, ib, ib, dtype=dt, device=dev)
-        ctr = torch.zeros(B, P, ib * NSYNC, dtype=torch.int32, device=dev)
+        ctr = torch.zeros(B, P, ib, dtype=torch.int32, device=dev)
     # Hoisted stride tuples + as_strided views: plain getitem slicing costs
     # ~4us per view on this host CPU and the loop below runs k/ib panels per
     # call, which is the CPU-bound regime for small/mid squares.
@@ -1554,7 +1538,7 @@ def _blocked_qr_mx(W, V, tau, Tbuf, m, n, k, ib=None):
             fused_t = True
         elif bm <= sram_max_m:
             # panel fits SRAM: single-CTA resident factorisation (no global re-reads)
-            _launch_geqrt_sram(W, V, tau, m, n, k, kk, ib_active, B)
+            _launch_geqrt_sram(W, V, tau, m, k, kk, ib_active, B)
         else:
             # ceil(M/rm) CTAs -> CHUNK == rm -> the register-resident
             # fast path of _geqrt_mcta_kernel (each CTA loads its row chunk
@@ -1577,7 +1561,6 @@ def _blocked_qr_mx(W, V, tau, Tbuf, m, n, k, ib=None):
                     rowj_buf,
                     ctr,
                     m,
-                    n,
                     k,
                     kk,
                     ib_active,
@@ -1587,7 +1570,7 @@ def _blocked_qr_mx(W, V, tau, Tbuf, m, n, k, ib=None):
                     rm=rm,
                 )
             else:
-                _launch_geqrt(W, V, tau, m, n, k, kk, ib_active, B)
+                _launch_geqrt(W, V, tau, m, k, kk, ib_active, B)
         Vp = torch.as_strided(V, (B, M, ib_active), sV, soV + kk * sV[1] + kk * sV[2])
         taup = torch.as_strided(tau, (B, ib_active), sTau, soTau + kk * sTau[1])
         Tp = torch.as_strided(
@@ -1606,7 +1589,7 @@ def _blocked_qr_mx(W, V, tau, Tbuf, m, n, k, ib=None):
                 soW + kk * sW[1] + (kk + ib_active) * sW[2],
             )
             _launch_larfb_mx(
-                Vp, taup, Tp, C, m - kk, n - (kk + ib_active), ib_active, B, upper=False
+                Vp, Tp, C, m - kk, n - (kk + ib_active), ib_active, B, upper=False
             )
 
 
@@ -1947,10 +1930,9 @@ def _assemble_q_mx(V, tau, Tbuf, m, n, k, qcols, ib, B, out):
     for kk in reversed(range(0, k, ib)):
         ib_active = min(ib, k - kk)
         Vp = V[:, kk:m, kk : kk + ib_active]
-        taup = tau[:, kk : kk + ib_active]
         Tp = Tbuf[:, kk : kk + ib_active, kk : kk + ib_active]
         _launch_larfb_mx(
-            Vp, taup, Tp, out[:, kk:m, :], m - kk, qcols, ib_active, B, upper=True
+            Vp, Tp, out[:, kk:m, :], m - kk, qcols, ib_active, B, upper=True
         )
     return out
 

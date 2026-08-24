@@ -92,10 +92,9 @@ def _assemble_q_safe(V, tau, Tbuf, m, n, k, qcols, ib, B, out):
     for kk in reversed(range(0, k, ib)):
         ib_active = min(ib, k - kk)
         Vp = V[:, kk:m, kk : kk + ib_active]
-        taup = tau[:, kk : kk + ib_active]
         Tp = Tbuf[:, kk : kk + ib_active, kk : kk + ib_active]
         _launch_larfb(
-            Vp, taup, Tp, out[:, kk:m, :], m - kk, qcols, ib_active, B, upper=True
+            Vp, Tp, out[:, kk:m, :], m - kk, qcols, ib_active, B, upper=True
         )
 
 

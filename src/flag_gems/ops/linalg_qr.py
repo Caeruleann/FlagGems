@@ -156,8 +156,6 @@ def _geqrt_kernel(
     M,
     kk,
     ib,
-    n,
-    k,
     nr,
     sWb,
     sWm,
@@ -296,8 +294,6 @@ def _geqrt_mcta_kernel(
     M,
     kk,
     ib,
-    n,
-    k,
     nr,
     p,
     sWb,
@@ -324,7 +320,6 @@ def _geqrt_mcta_kernel(
     RM: tl.constexpr,
     IBN: tl.constexpr,
     NC: tl.constexpr,
-    NSYNC: tl.constexpr,
     NUM_TILES: tl.constexpr,
 ):
     pid_b = tle.program_id(0)
@@ -357,9 +352,8 @@ def _geqrt_mcta_kernel(
             mask=rmask[:, None] & cmask[None, :],
             other=zero,
         )
-        # tau accumulates in registers and is flushed with ONE vector store
-        # after the loop -- 0-d scalar stores are unreliable on some vendor
-        # backends
+        # tau accumulates in registers, flushed with ONE vector store after the
+        # loop (0-d scalar stores: see _geqrt_kernel)
         tau_arr = tl.zeros([IBN], dtype=dt)
         for j in range(nr):
             # column j from the sustained panel chunk
@@ -390,7 +384,7 @@ def _geqrt_mcta_kernel(
                 rowj_c,
                 mask=col_idx < ib,
             )
-            _barrier(ctr, pid_b * sCtrB + p * sCtrM + j * NSYNC + 0, NC)
+            _barrier(ctr, pid_b * sCtrB + p * sCtrM + j, NC)
             alpha = tl.load(alpha_buf + pid_b * sAB + p * sAM + j, volatile=True)
             xnorm_sq = tl.load(xnorm_buf + pid_b * sXB + p * sXM + j, volatile=True)
             wraw = tl.load(
@@ -444,9 +438,8 @@ def _geqrt_mcta_kernel(
         # Same single-barrier scheme as the fast path: accumulate the unscaled
         # w partials (wraw / rowj) together with alpha/xnorm in ONE tile loop,
         # barrier once, then fix up with the tau/denom scalars.
-        # tau and the R diagonal accumulate in registers and are flushed with
-        # one vector store each after the loop -- 0-d scalar stores are
-        # unreliable on some vendor backends
+        # tau and the R diagonal accumulate in registers, flushed with one
+        # vector store each after the loop (0-d scalar stores: see _geqrt_kernel)
         tau_arr = tl.zeros([IBN], dtype=dt)
         rdg = tl.zeros([IBN], dtype=dt)
         for j in range(nr):
@@ -488,7 +481,7 @@ def _geqrt_mcta_kernel(
                 rowj_c,
                 mask=col_idx < ib,
             )
-            _barrier(ctr, pid_b * sCtrB + p * sCtrM + j * NSYNC + 0, NC)
+            _barrier(ctr, pid_b * sCtrB + p * sCtrM + j, NC)
             alpha = tl.load(alpha_buf + pid_b * sAB + p * sAM + j, volatile=True)
             xnorm_sq = tl.load(xnorm_buf + pid_b * sXB + p * sXM + j, volatile=True)
             wraw = tl.load(
@@ -996,7 +989,6 @@ def _qr_fused_kernel(
         R_tile,
         mask=rrmask[:, None] & cmask[None, :],
     )
-    # tau output
     tl.store(TAU + pid * sTauB + ik * sTauN, tau_arr, mask=ik < k)
 
     if put_Q:
@@ -1039,8 +1031,6 @@ def _geqrt_sram_kernel(
     M,
     ib,
     kk,
-    n,
-    k,
     sWb,
     sWm,
     sWn,
@@ -1074,8 +1064,8 @@ def _geqrt_sram_kernel(
         other=zero,
     )
 
-    # tau accumulates in registers and is flushed with ONE vector store after
-    # the loop -- 0-d scalar stores are unreliable on some vendor backends
+    # tau accumulates in registers, flushed with ONE vector store after the
+    # loop (0-d scalar stores: see _geqrt_kernel)
     tau_arr = tl.zeros([IBN], dtype=dt)
     for j in range(ib):
         col_j = tl.sum(tl.where(cn[None, :] == j, A, zero), axis=1)
@@ -1091,7 +1081,6 @@ def _geqrt_sram_kernel(
         # R diagonal + reflector tail into the in-SRAM panel
         A = tl.where((rm[:, None] == j) & (cn[None, :] == j), beta_eff, A)
         A = tl.where((rm[:, None] > j) & (cn[None, :] == j), v_tail[:, None], A)
-        # write tau
         tau_arr = tl.where(cn == j, tau, tau_arr)
         # write Householder vector vj (0/<j, 1/==j, tail/>j) to the V buffer
         vj = tl.where(rm > j, v_tail, tl.where(rm == j, one, zero))
@@ -1226,7 +1215,6 @@ def _larft_kernel(
 @triton.jit
 def _larfb_kernel(
     V,
-    TAU,
     TOUT,
     C,
     M,
@@ -1235,8 +1223,6 @@ def _larfb_kernel(
     sVb,
     sVm,
     sVn,
-    sTauB,
-    sTauN,
     sTb,
     sTm,
     sTn,
@@ -1430,11 +1416,9 @@ def _tcompose_pair_kernel(
 @triton.jit
 def _assemble_q_fused_kernel(
     V,
-    TAU,
     Tbuf,
     Q,
     m,
-    n,
     k,
     qcols,
     ib,
@@ -1442,8 +1426,6 @@ def _assemble_q_fused_kernel(
     sVb,
     sVm,
     sVn,
-    sTauB,
-    sTauN,
     sTb,
     sTm,
     sTn,
@@ -1654,7 +1636,7 @@ def _identity_kernel(Q, m, qcols, grid_e, sQb, sQm, sQn, BLOCK: tl.constexpr):
 # ===========================================================================
 # Python orchestration (memory/layout + kernel launches only)
 # ===========================================================================
-def _launch_geqrt_sram(W, V, tau, m, n, k, kk, ib, B):
+def _launch_geqrt_sram(W, V, tau, m, k, kk, ib, B):
     """SRAM-resident panel factorisation (single CTA per batch)."""
     ib_active = min(ib, k - kk)
     M = m - kk
@@ -1668,8 +1650,6 @@ def _launch_geqrt_sram(W, V, tau, m, n, k, kk, ib, B):
         M,
         ib_active,
         kk,
-        n,
-        k,
         sWb,
         sWm,
         sWn,
@@ -1684,7 +1664,7 @@ def _launch_geqrt_sram(W, V, tau, m, n, k, kk, ib, B):
     )
 
 
-def _launch_geqrt(W, V, tau, m, n, k, kk, ib, B):
+def _launch_geqrt(W, V, tau, m, k, kk, ib, B):
     ib_active = min(ib, k - kk)
     M = m - kk
     nr = min(ib_active, k - kk)
@@ -1698,8 +1678,6 @@ def _launch_geqrt(W, V, tau, m, n, k, kk, ib, B):
         M,
         kk,
         ib_active,
-        n,
-        k,
         nr,
         sWb,
         sWm,
@@ -1724,7 +1702,6 @@ def _launch_geqrt_mcta(
     rowj_buf,
     ctr,
     m,
-    n,
     k,
     kk,
     ib,
@@ -1740,7 +1717,6 @@ def _launch_geqrt_mcta(
     # panel (ib_active < blocking) kk // ib_active would index far out of bounds.
     CHUNK = (M + NC - 1) // NC
     NUM_TILES = (CHUNK + rm - 1) // rm
-    NSYNC = 2
     sWb, sWm, sWn = W.stride()
     sVb, sVm, sVn = V.stride()
     sTauB, sTauN = tau.stride()
@@ -1761,8 +1737,6 @@ def _launch_geqrt_mcta(
         M,
         kk,
         ib,
-        n,
-        k,
         nr,
         p,
         sWb,
@@ -1789,13 +1763,12 @@ def _launch_geqrt_mcta(
         RM=rm,
         IBN=max(16, triton.next_power_of_2(ib)),
         NC=NC,
-        NSYNC=NSYNC,
         NUM_TILES=NUM_TILES,
         num_warps=_MCTA_WARPS,
     )
 
 
-def _launch_larft(V, tau, Tout, m, kk, ib, B, warps=None):
+def _launch_larft(V, tau, Tout, m, kk, ib, B):
     M = m - kk
     sVb, sVm, sVn = V.stride()
     sTauB, sTauN = tau.stride()
@@ -1817,14 +1790,13 @@ def _launch_larft(V, tau, Tout, m, kk, ib, B, warps=None):
         RM=_PANEL_RM,
         IBN=max(16, triton.next_power_of_2(ib)),
         INVERT=V.element_size() == 4,
-        num_warps=_LARFT_WARPS if warps is None else warps,
+        num_warps=_LARFT_WARPS,
     )
 
 
-def _launch_larfb(V, tau, Tp, C, m, p, ib, B, upper):
+def _launch_larfb(V, Tp, C, m, p, ib, B, upper):
     """Apply block reflector; T loaded from Tp (pre-computed by _launch_larft)."""
     sVb, sVm, sVn = V.stride()
-    sTauB, sTauN = tau.stride()
     sTb, sTm, sTn = Tp.stride()
     sCb, sCm, sCn = C.stride()
     # TN=32 is a ~1.9x win for the fp32 GEMM path on large trailing updates;
@@ -1833,7 +1805,6 @@ def _launch_larfb(V, tau, Tp, C, m, p, ib, B, upper):
     grid_p = (p + tn - 1) // tn
     _larfb_kernel[(B, grid_p)](
         V,
-        tau,
         Tp,
         C,
         m,
@@ -1842,8 +1813,6 @@ def _launch_larfb(V, tau, Tp, C, m, p, ib, B, upper):
         sVb,
         sVm,
         sVn,
-        sTauB,
-        sTauN,
         sTb,
         sTm,
         sTn,
@@ -1947,20 +1916,19 @@ def _blocked_qr(W, V, tau, Tbuf, m, n, k, ib=_PANEL_IB):
     needs_mcta = any(
         triton.next_power_of_2(m - kk) > sram_max_m for kk in range(0, k, ib)
     )
-    NSYNC = 2
     if needs_mcta:
         alpha_buf = torch.zeros(B, P, ib, dtype=dt, device=dev)
         xnorm_buf = torch.zeros(B, P, ib, dtype=dt, device=dev)
         w_sum = torch.zeros(B, P, ib, ib, dtype=dt, device=dev)
         rowj_buf = torch.zeros(B, P, ib, ib, dtype=dt, device=dev)
-        ctr = torch.zeros(B, P, ib * NSYNC, dtype=torch.int32, device=dev)
+        ctr = torch.zeros(B, P, ib, dtype=torch.int32, device=dev)
     for kk in range(0, k, ib):
         ib_active = min(ib, k - kk)
         M = m - kk
         bm = triton.next_power_of_2(M)
         if bm <= sram_max_m:
             # panel fits SRAM: single-CTA resident factorisation (no global re-reads)
-            _launch_geqrt_sram(W, V, tau, m, n, k, kk, ib_active, B)
+            _launch_geqrt_sram(W, V, tau, m, k, kk, ib_active, B)
         else:
             # ceil(M/rm) CTAs -> CHUNK == rm -> the register-resident
             # fast path of _geqrt_mcta_kernel (each CTA loads its row chunk
@@ -1978,7 +1946,6 @@ def _blocked_qr(W, V, tau, Tbuf, m, n, k, ib=_PANEL_IB):
                     rowj_buf,
                     ctr,
                     m,
-                    n,
                     k,
                     kk,
                     ib_active,
@@ -1988,7 +1955,7 @@ def _blocked_qr(W, V, tau, Tbuf, m, n, k, ib=_PANEL_IB):
                     rm=rm,
                 )
             else:
-                _launch_geqrt(W, V, tau, m, n, k, kk, ib_active, B)
+                _launch_geqrt(W, V, tau, m, k, kk, ib_active, B)
         Vp = V[:, kk:m, kk : kk + ib_active]
         taup = tau[:, kk : kk + ib_active]
         Tp = Tbuf[:, kk : kk + ib_active, kk : kk + ib_active]
@@ -1996,7 +1963,7 @@ def _blocked_qr(W, V, tau, Tbuf, m, n, k, ib=_PANEL_IB):
             _launch_larft(Vp, taup, Tp, m, kk, ib_active, B)
             C = W[:, kk:m, kk + ib_active : n]
             _launch_larfb(
-                Vp, taup, Tp, C, m - kk, n - (kk + ib_active), ib_active, B, upper=False
+                Vp, Tp, C, m - kk, n - (kk + ib_active), ib_active, B, upper=False
             )
 
 
@@ -2057,7 +2024,6 @@ def _assemble_q(V, tau, Tbuf, m, n, k, qcols, ib, B, out):
         # on 4096^2 (measured).  The paired path below composes pairs from the
         # EXISTING per-panel T's instead (no inversion), which is cheap.
         sVb, sVm, sVn = V.stride()
-        sTauB, sTauN = tau.stride()
         sTb, sTm, sTn = Tbuf.stride()
         sQb, sQm, sQn = out.stride()
         ib2 = 2 * ib
@@ -2087,11 +2053,9 @@ def _assemble_q(V, tau, Tbuf, m, n, k, qcols, ib, B, out):
         grid_p = (qcols + _ASSEMBLE_TN - 1) // _ASSEMBLE_TN
         _assemble_q_fused_kernel[(B, grid_p)](
             V,
-            tau,
             Tbuf,
             out,
             m,
-            n,
             k,
             qcols,
             use_ib,
@@ -2099,8 +2063,6 @@ def _assemble_q(V, tau, Tbuf, m, n, k, qcols, ib, B, out):
             sVb,
             sVm,
             sVn,
-            sTauB,
-            sTauN,
             sTb,
             sTm,
             sTn,
@@ -2124,10 +2086,9 @@ def _assemble_q(V, tau, Tbuf, m, n, k, qcols, ib, B, out):
             kk = p
             ib_active = min(ib, k - kk)
             Vp = V[:, kk:m, kk : kk + ib_active]
-            taup = tau[:, kk : kk + ib_active]
             Tp = Tbuf[:, kk : kk + ib_active, kk : kk + ib_active]
             _launch_larfb(
-                Vp, taup, Tp, out[:, kk:m, :], m - kk, qcols, ib_active, B, upper=True
+                Vp, Tp, out[:, kk:m, :], m - kk, qcols, ib_active, B, upper=True
             )
     return out
 
