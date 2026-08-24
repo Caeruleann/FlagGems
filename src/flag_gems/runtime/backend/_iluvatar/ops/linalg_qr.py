@@ -93,9 +93,7 @@ def _assemble_q_safe(V, tau, Tbuf, m, n, k, qcols, ib, B, out):
         ib_active = min(ib, k - kk)
         Vp = V[:, kk:m, kk : kk + ib_active]
         Tp = Tbuf[:, kk : kk + ib_active, kk : kk + ib_active]
-        _launch_larfb(
-            Vp, Tp, out[:, kk:m, :], m - kk, qcols, ib_active, B, upper=True
-        )
+        _launch_larfb(Vp, Tp, out[:, kk:m, :], m - kk, qcols, ib_active, B, upper=True)
 
 
 def _linalg_qr_blocked_safe(A, mode, out=None):
