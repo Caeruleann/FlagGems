@@ -2345,6 +2345,33 @@ def _validate_mode(mode):
         )
 
 
+def _validate_out(out, dtype, batch_shape, m, n, mode):
+    """Enforce torch's out= contract: matching dtype and exact shapes.
+
+    torch raises on an out dtype mismatch; on a shape mismatch it resizes
+    (deprecated), so a hard error here is the future-proof behaviour -- and
+    it catches wrong-but-reshapeable shapes that would silently pass.
+    """
+    k = min(m, n)
+    if mode == "r":
+        q_shape, r_shape = (0,), (*batch_shape, k, n)
+    elif mode == "reduced":
+        q_shape, r_shape = (*batch_shape, m, k), (*batch_shape, k, n)
+    else:
+        q_shape, r_shape = (*batch_shape, m, m), (*batch_shape, m, n)
+    for name, t, shape in (("Q", out[0], q_shape), ("R", out[1], r_shape)):
+        if t.dtype != dtype:
+            raise RuntimeError(
+                f"linalg_qr: expected out tensor {name} to have dtype {dtype}, "
+                f"but got {t.dtype}"
+            )
+        if tuple(t.shape) != tuple(shape):
+            raise RuntimeError(
+                f"linalg_qr: out tensor {name} has shape {tuple(t.shape)}, "
+                f"expected {tuple(shape)}"
+            )
+
+
 def linalg_qr(A, mode="reduced", *, out=None):
     logger.debug("GEMS LINALG_QR")
     return _linalg_qr(A, mode, out=out)
@@ -2368,6 +2395,9 @@ def _linalg_qr(A, mode="reduced", *, out=None):
     B = 1
     for d in batch_shape:
         B *= d
+
+    if out is not None:
+        _validate_out(out, A.dtype, batch_shape, m, n, mode)
 
     if m == 0 or n == 0:
         # Degenerate input: no factorisation to run.  torch.linalg.qr returns

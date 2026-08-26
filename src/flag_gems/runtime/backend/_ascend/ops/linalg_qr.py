@@ -50,7 +50,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_gems.ops.linalg_qr import _validate_mode
+from flag_gems.ops.linalg_qr import _validate_mode, _validate_out
 from flag_gems.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
@@ -1553,6 +1553,8 @@ def _linalg_qr(A, mode="reduced", *, out=None):
             "FlagGems linalg_qr currently supports float32 and float64 inputs; "
             f"got dtype={A.dtype}"
         )
+    if out is not None:
+        _validate_out(out, A.dtype, A.shape[:-2], A.shape[-2], A.shape[-1], mode)
     return _ascend_linalg_qr(A, mode, out=out)
 
 

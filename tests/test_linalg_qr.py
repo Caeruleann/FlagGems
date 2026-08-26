@@ -203,6 +203,36 @@ def test_linalg_qr_out(shape, dtype, mode):
     _assert_qr_valid(out_Q, out_R, ref_Q, ref_R, mode, dtype)
 
 
+@pytest.mark.linalg_qr_out
+@pytest.mark.parametrize("shape", [(8, 8), (2, 4, 4)])
+@pytest.mark.parametrize("mode", QR_MODES)
+@pytest.mark.parametrize("bad", ["q_dtype", "r_dtype", "q_shape", "r_shape"])
+def test_linalg_qr_out_invalid(shape, mode, bad):
+    """out= tensors must match the input dtype and the exact output shapes.
+
+    torch raises on a dtype mismatch; gems raises on shape mismatches too
+    (torch's implicit resize is deprecated) -- including wrong shapes whose
+    element count happens to make them reshapeable onto the expected one.
+    """
+    dtype = torch.float32
+    inp = torch.randn(shape, dtype=dtype, device=DEVICE)
+    q_shape, r_shape = _qr_out_shapes(shape, mode)
+    out_Q = torch.empty(q_shape, dtype=dtype, device=DEVICE)
+    out_R = torch.empty(r_shape, dtype=dtype, device=DEVICE)
+    if bad == "q_dtype":
+        out_Q = torch.empty(q_shape, dtype=torch.bfloat16, device=DEVICE)
+    elif bad == "r_dtype":
+        out_R = torch.empty(r_shape, dtype=torch.bfloat16, device=DEVICE)
+    elif bad == "q_shape":
+        # wrong rank but reshapeable onto the expected (B, ...) layout
+        out_Q = torch.empty((1,) + tuple(q_shape), dtype=dtype, device=DEVICE)
+    else:
+        out_R = torch.empty((1,) + tuple(r_shape), dtype=dtype, device=DEVICE)
+    with pytest.raises(RuntimeError):
+        with flag_gems.use_gems():
+            torch.linalg.qr(inp, mode=mode, out=(out_Q, out_R))
+
+
 @pytest.mark.linalg_qr
 @pytest.mark.parametrize("shape", [(33, 33), (4, 64, 40), (4, 8, 32)])
 @pytest.mark.parametrize("dtype", _TEST_DTYPES)

@@ -92,6 +92,7 @@ from flag_gems.ops.linalg_qr import (
     _tsqr_local_sram_kernel,
     _tsqr_tree_kernel,
     _validate_mode,
+    _validate_out,
 )
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as tle
@@ -1964,6 +1965,9 @@ def _linalg_qr_mx(A, mode="reduced", *, out=None):
     B = 1
     for d in batch_shape:
         B *= d
+
+    if out is not None:
+        _validate_out(out, A.dtype, batch_shape, m, n, mode)
 
     if m == 0 or n == 0:
         # Degenerate input: no factorisation to run.  torch.linalg.qr returns

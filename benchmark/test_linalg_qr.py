@@ -27,7 +27,9 @@ def _gems_qr_out(A, out=None, mode="reduced"):
 
 
 # All three torch.linalg.qr modes are benchmarked (the accuracy tests cover
-# the same set): reduced (default), complete (requires m >= n), r (R only).
+# the same set): reduced (default), complete, r (R only).  For wide inputs
+# (m < n) complete coincides with reduced (k = m), so every mode is valid
+# for every shape.
 # Shapes come from the linalg_qr / linalg_qr_out entries in core_shapes.yaml.
 QR_MODES = ["reduced", "complete", "r"]
 
@@ -51,8 +53,6 @@ def _qr_out_shapes(shape, mode):
 def _make_qr_input_fn(mode):
     def input_fn(shape, dtype, device):
         shape = tuple(shape)
-        if mode == "complete" and shape[-2] < shape[-1]:
-            return  # complete mode requires m >= n
         yield torch.randn(shape, dtype=dtype, device=device), {"mode": mode}
 
     return input_fn
@@ -61,8 +61,6 @@ def _make_qr_input_fn(mode):
 def _make_qr_out_input_fn(mode):
     def input_fn(shape, dtype, device):
         shape = tuple(shape)
-        if mode == "complete" and shape[-2] < shape[-1]:
-            return  # complete mode requires m >= n
         A = torch.randn(shape, dtype=dtype, device=device)
         Qshape, Rshape = _qr_out_shapes(shape, mode)
         Q = torch.empty(Qshape, dtype=dtype, device=device)

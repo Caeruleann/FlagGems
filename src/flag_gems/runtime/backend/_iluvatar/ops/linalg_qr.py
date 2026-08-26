@@ -31,7 +31,7 @@ from flag_gems.ops.linalg_qr import (
     _launch_larft,
 )
 from flag_gems.ops.linalg_qr import _linalg_qr as _generic_linalg_qr
-from flag_gems.ops.linalg_qr import _triu_copy
+from flag_gems.ops.linalg_qr import _triu_copy, _validate_mode, _validate_out
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +140,11 @@ def _linalg_qr_blocked_safe(A, mode, out=None):
 
 def _linalg_qr_impl(A, mode, out=None):
     """Routing shared by linalg_qr / linalg_qr_out (no logging)."""
+    # the safe-assembly route bypasses the generic entry; validate here so an
+    # invalid mode raises instead of being silently treated as non-reduced
+    _validate_mode(mode)
+    if out is not None and A.dim() >= 2:
+        _validate_out(out, A.dtype, A.shape[:-2], A.shape[-2], A.shape[-1], mode)
     if _use_safe_q_assembly(A, mode):
         return _linalg_qr_blocked_safe(A, mode, out=out)
     return _generic_linalg_qr(A, mode, out=out)
