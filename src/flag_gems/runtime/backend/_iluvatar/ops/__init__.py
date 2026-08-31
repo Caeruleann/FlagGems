@@ -92,13 +92,10 @@ __all__ = [
     "index_select_backward",
     "linalg_cholesky",
     "linalg_matrix_norm",
-<<<<<<< HEAD
     "linalg_qr",
     "linalg_qr_out",
-=======
     "linalg_solve_triangular",
     "linalg_solve_triangular_out",
->>>>>>> origin/master
     "linear",
     "log_normal_",
     "matmul_bf16",

@@ -120,13 +120,10 @@ __all__ = [
     "layer_norm_backward",
     "lgamma",
     "lgamma_",
-<<<<<<< HEAD
     "linalg_qr",
     "linalg_qr_out",
-=======
     "linalg_solve_triangular",
     "linalg_solve_triangular_out",
->>>>>>> origin/master
     "linalg_svdvals",
     "log_sigmoid_forward",
     "log_softmax",
