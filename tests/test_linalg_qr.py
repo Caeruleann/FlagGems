@@ -149,8 +149,7 @@ def test_linalg_qr(shape, dtype, mode):
     ref_inp = utils.to_reference(inp)
 
     ref_Q, ref_R = torch.linalg.qr(ref_inp, mode=mode)
-    with flag_gems.use_gems():
-        res_Q, res_R = torch.linalg.qr(inp, mode=mode)
+    res_Q, res_R = flag_gems.linalg_qr(inp, mode=mode)
 
     _assert_qr_valid(res_Q, res_R, ref_Q, ref_R, mode, dtype)
 
@@ -189,8 +188,7 @@ def test_linalg_qr_out(shape, dtype, mode):
     # is caught instead of going unnoticed.
     res_Q = torch.full(ref_Q.shape, float("nan"), dtype=dtype, device=DEVICE)
     res_R = torch.full(ref_R.shape, float("nan"), dtype=dtype, device=DEVICE)
-    with flag_gems.use_gems():
-        out_Q, out_R = torch.linalg.qr(inp, mode=mode, out=(res_Q, res_R))
+    out_Q, out_R = flag_gems.linalg_qr_out(inp, mode=mode, Q=res_Q, R=res_R)
 
     # The out variant must write in place and return the same tensors.
     assert out_Q.data_ptr() == res_Q.data_ptr()
@@ -229,8 +227,7 @@ def test_linalg_qr_out_invalid(shape, mode, bad):
     else:
         out_R = torch.empty((1,) + tuple(r_shape), dtype=dtype, device=DEVICE)
     with pytest.raises(RuntimeError):
-        with flag_gems.use_gems():
-            torch.linalg.qr(inp, mode=mode, out=(out_Q, out_R))
+        flag_gems.linalg_qr_out(inp, mode=mode, Q=out_Q, R=out_R)
 
 
 @pytest.mark.linalg_qr
@@ -247,8 +244,7 @@ def test_linalg_qr_non_contiguous(shape, dtype):
     ref_inp = utils.to_reference(inp)
 
     ref_Q, ref_R = torch.linalg.qr(ref_inp)
-    with flag_gems.use_gems():
-        res_Q, res_R = torch.linalg.qr(inp)
+    res_Q, res_R = flag_gems.linalg_qr(inp)
 
     _assert_qr_valid(res_Q, res_R, ref_Q, ref_R, "reduced", dtype)
 
@@ -257,8 +253,7 @@ def test_linalg_qr_non_contiguous(shape, dtype):
 def test_linalg_qr_invalid_mode():
     inp = torch.randn(4, 4, device=DEVICE)
     with pytest.raises(ValueError):
-        with flag_gems.use_gems():
-            torch.linalg.qr(inp, mode="nonsense")
+        flag_gems.linalg_qr(inp, mode="nonsense")
 
 
 @pytest.mark.linalg_qr
@@ -283,8 +278,7 @@ def test_linalg_qr_input_not_mutated(shape, dtype):
     inp = torch.randn(shape, dtype=dtype, device=DEVICE)
     orig = inp.clone()
 
-    with flag_gems.use_gems():
-        torch.linalg.qr(inp, mode="reduced")
+    flag_gems.linalg_qr(inp, mode="reduced")
 
     assert torch.equal(inp, orig)
 
@@ -305,8 +299,7 @@ def test_linalg_qr_zero_column(shape, dtype):
     inp = torch.randn(shape, dtype=dtype, device=DEVICE)
     inp[..., 1] = 0
 
-    with flag_gems.use_gems():
-        res_Q, res_R = torch.linalg.qr(inp, mode="reduced")
+    res_Q, res_R = flag_gems.linalg_qr(inp, mode="reduced")
 
     assert not torch.isnan(res_Q).any() and not torch.isnan(res_R).any()
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -356,8 +349,7 @@ def test_linalg_qr_rank_deficient(shape, kind, dtype):
             1, n, dtype=dtype, device=DEVICE
         )
 
-    with flag_gems.use_gems():
-        res_Q, res_R = torch.linalg.qr(inp, mode="reduced")
+    res_Q, res_R = flag_gems.linalg_qr(inp, mode="reduced")
 
     assert not torch.isnan(res_Q).any() and not torch.isnan(res_R).any()
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -380,14 +372,20 @@ def test_linalg_qr_empty(shape, mode):
     inp = torch.randn(shape, device=DEVICE)
 
     ref_Q, ref_R = torch.linalg.qr(inp, mode=mode)
-    with flag_gems.use_gems():
-        res_Q, res_R = torch.linalg.qr(inp, mode=mode)
+    res_Q, res_R = flag_gems.linalg_qr(inp, mode=mode)
 
     assert res_Q.shape == ref_Q.shape
     assert res_R.shape == ref_R.shape
     if mode == "complete" and res_Q.numel() > 0:
         eye = torch.eye(res_Q.shape[-1], device=DEVICE).expand_as(res_Q)
         assert torch.equal(res_Q, eye)
+
+    # The degenerate branch also serves the out= variant (same buffers back).
+    out_Q = torch.empty(ref_Q.shape, device=DEVICE)
+    out_R = torch.empty(ref_R.shape, device=DEVICE)
+    ret_Q, ret_R = flag_gems.linalg_qr_out(inp, mode=mode, Q=out_Q, R=out_R)
+    assert ret_Q.data_ptr() == out_Q.data_ptr()
+    assert ret_R.data_ptr() == out_R.data_ptr()
 
 
 @pytest.mark.linalg_qr
@@ -403,8 +401,7 @@ def test_linalg_qr_transposed_input(shape, dtype):
     ref_inp = utils.to_reference(inp)
 
     ref_Q, ref_R = torch.linalg.qr(ref_inp)
-    with flag_gems.use_gems():
-        res_Q, res_R = torch.linalg.qr(inp)
+    res_Q, res_R = flag_gems.linalg_qr(inp)
 
     _assert_qr_valid(res_Q, res_R, ref_Q, ref_R, "reduced", dtype)
 
@@ -415,13 +412,11 @@ def test_linalg_qr_unsupported_dtype(dtype):
     """Unsupported dtypes raise NotImplementedError (not a wrong result)."""
     inp = torch.randn(8, 8, device=DEVICE).to(dtype)
     with pytest.raises(NotImplementedError):
-        with flag_gems.use_gems():
-            torch.linalg.qr(inp)
+        flag_gems.linalg_qr(inp)
 
 
 @pytest.mark.linalg_qr
 def test_linalg_qr_dim_lt_2():
     inp = torch.randn(8, device=DEVICE)
     with pytest.raises(RuntimeError):
-        with flag_gems.use_gems():
-            torch.linalg.qr(inp)
+        flag_gems.linalg_qr(inp)
