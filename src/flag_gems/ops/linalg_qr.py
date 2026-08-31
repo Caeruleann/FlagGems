@@ -906,7 +906,6 @@ def _qr_fused_kernel(
     W,
     Qout,
     Rout,
-    TAU,
     m,
     n,
     k,
@@ -922,8 +921,6 @@ def _qr_fused_kernel(
     sRb,
     sRm,
     sRn,
-    sTauB,
-    sTauN,
     BM: tl.constexpr,
     BN: tl.constexpr,
     BQ: tl.constexpr,
@@ -989,7 +986,6 @@ def _qr_fused_kernel(
         R_tile,
         mask=rrmask[:, None] & cmask[None, :],
     )
-    tl.store(TAU + pid * sTauB + ik * sTauN, tau_arr, mask=ik < k)
 
     if put_Q:
         # Q (m x qcols) = identity, then apply reflectors in reverse
@@ -1850,7 +1846,6 @@ def _fused_qr(W, A, orig_dtype, batch_shape, m, n, k, mode, B, out_Q=None, out_R
             else torch.empty(B, m, qcols, dtype=dt, device=dev)
         )
     R = out_R if out_R is not None else torch.empty(B, rrows, n, dtype=dt, device=dev)
-    tau = torch.empty(B, k, dtype=dt, device=dev)
     BM = triton.next_power_of_2(m)
     BN = triton.next_power_of_2(n)
     BQ = triton.next_power_of_2(max(qcols, 1))
@@ -1858,12 +1853,10 @@ def _fused_qr(W, A, orig_dtype, batch_shape, m, n, k, mode, B, out_Q=None, out_R
     sWb, sWm, sWn = W.stride()
     sQb, sQm, sQn = Q.stride()
     sRb, sRm, sRn = R.stride()
-    sTauB, sTauN = tau.stride()
     _qr_fused_kernel[(B,)](
         W,
         Q,
         R,
-        tau,
         m,
         n,
         k,
@@ -1879,8 +1872,6 @@ def _fused_qr(W, A, orig_dtype, batch_shape, m, n, k, mode, B, out_Q=None, out_R
         sRb,
         sRm,
         sRn,
-        sTauB,
-        sTauN,
         BM=BM,
         BN=BN,
         BQ=BQ,
