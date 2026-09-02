@@ -7,7 +7,7 @@ import flag_gems
 from . import base, consts
 
 
-class UnsafeIndexAccBenchmark(base.GenericBenchmark):
+class UnsafeIndexBenchmark(base.GenericBenchmark):
     def set_more_shapes(self):
         INDEX_SHAPE = (
             ((2**28,), ((2**16,),)),
@@ -26,6 +26,10 @@ class UnsafeIndexAccBenchmark(base.GenericBenchmark):
                     (2, 8),
                 ),
             ),
+            ((1, 4096, 512), (None, (32768,), None)),
+            ((4, 512, 128), (None, (4096,), None)),
+            ((512, 512, 512), ((128,), None, (128,))),
+            ((64, 512, 512), ((128,), None)),
         )
         self.shapes = INDEX_SHAPE
         return None
@@ -33,9 +37,12 @@ class UnsafeIndexAccBenchmark(base.GenericBenchmark):
 
 def gen_indices(input_shape, indices_shape, accumulate):
     indices = []
-    for i, shape in enumerate(indices_shape):
+    for dim, shape in enumerate(indices_shape):
+        if shape is None:
+            indices.append(None)
+            continue
         index = np.random.choice(
-            np.arange(input_shape[i]), size=shape, replace=accumulate
+            np.arange(input_shape[dim]), size=shape, replace=accumulate
         )
         indices.append(torch.tensor(index, device=flag_gems.device))
 
@@ -53,13 +60,13 @@ def _input_fn(shapes, dtype, device):
 
 
 @pytest.mark.unsafe_index
-def test_unsafe_index_acc_perf():
-    bench = UnsafeIndexAccBenchmark(
+def test_unsafe_index():
+    bench = UnsafeIndexBenchmark(
         op_name="unsafe_index",
         torch_op=torch.ops.aten._unsafe_index,
         input_fn=_input_fn,
         dtypes=consts.FLOAT_DTYPES,
     )
-    bench.set_gems(flag_gems._unsafe_index)
+    bench.set_gems(flag_gems.unsafe_index)
 
     bench.run()

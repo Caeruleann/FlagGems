@@ -31,90 +31,88 @@ UNSAFE_INDEX_ACC_SHAPE = (
             (2, 8),
         ),
     ),
+    # Width chosen so cdiv(N, BLOCK_SIZE1) exceeds CUDA's 65535 gridDim.y
+    # limit; the launch spills the overflow into grid axis 2 (regression).
+    ((2, 65536 * 256 + 256), ((2,),)),
+    ((0, 32), ((0,), None)),  # zero-size dim
+    ((16, 16), ((),)),  # 0-d index on dim 0 (behaves like an int index)
+    ((16, 16), (None, ())),  # 0-d index on dim 1
+    ((8, 6, 4), (None, (), None)),  # 0-d index on the middle dim
+    ((8, 6, 4), ((), (3,))),  # 0-d index mixed with a tensor index
+    # A 0-d index separated from the tensor index by None: aten counts 0-d
+    # tensors as advanced indices, so the broadcast subspace goes to the
+    # front of the output (out shape (2, 6), not (6, 2)).
+    ((4, 6, 3), ((), None, (2,))),
 )
 
 # Make sure every thread has the same seed.
 random.seed(time.time() // 100)
 
 
-def gen_indices(input_shape, indices_shape, accumulate):
+def gen_indices(input_shape, indices_shape, accumulate, index_dtype=torch.int64):
     """
     Generate indices for torch.ops.aten._unsafe_index.
     All index tensors must be broadcastable, so we ensure they have compatible
-    shapes (same logic as tests/test_index.py::gen_indices).
+    shapes (same logic as tests/test_index.py::gen_indices).  A None entry
+    yields a None index; an empty tuple yields a 0-d index tensor.
     """
     indices = []
     if len(indices_shape) > 0:
         sizes = []
         for shape in indices_shape:
+            if shape is None:
+                continue
             if isinstance(shape, int):
                 sizes.append(shape)
             elif isinstance(shape, (tuple, list)) and len(shape) > 0:
                 sizes.append(shape[0])
-            else:
-                sizes.append(16)
         common_size = min(sizes) if sizes else 16
 
         for i, shape in enumerate(indices_shape):
+            if shape is None:
+                indices.append(None)
+                continue
             if isinstance(shape, int):
                 size = min(shape, common_size)
             elif isinstance(shape, (tuple, list)) and len(shape) > 0:
                 size = min(shape[0], common_size)
             else:
-                size = common_size
+                size = ()  # 0-d index tensor
             index = np.random.choice(
-                np.arange(input_shape[i]), size=size, replace=accumulate
+                # [-n, n): negative entries exercise the in-kernel wrap.
+                np.arange(-input_shape[i], input_shape[i]),
+                size=size,
+                replace=accumulate,
             )
-            indices.append(torch.tensor(index, device=flag_gems.device))
+            indices.append(
+                torch.tensor(index, device=flag_gems.device, dtype=index_dtype)
+            )
     return indices
 
 
 @pytest.mark.unsafe_index
 @pytest.mark.parametrize("input_shape, indices_shape", UNSAFE_INDEX_ACC_SHAPE)
+@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
-def test_unsafe_index(input_shape, indices_shape, dtype):
+def test_unsafe_index(input_shape, indices_shape, index_dtype, dtype):
     inp = torch.randn(
         input_shape, dtype=dtype, device=flag_gems.device, requires_grad=False
     )
     try:
-        indices = gen_indices(input_shape, indices_shape, True)
+        indices = gen_indices(input_shape, indices_shape, True, index_dtype)
     except Exception:
         return False
 
     ref_inp = utils.to_reference(inp)
-    ref_indices = [utils.to_reference(index) for index in indices]
+    ref_indices = [
+        None if index is None else utils.to_reference(index) for index in indices
+    ]
     try:
         ref_out = torch.ops.aten._unsafe_index(ref_inp, ref_indices)
     except (IndexError, RuntimeError):
         return False
 
-    with flag_gems.use_gems():
-        out = torch.ops.aten._unsafe_index(inp, indices)
-
-    utils.gems_assert_close(out, ref_out, dtype)
-
-
-@pytest.mark.unsafe_index
-@pytest.mark.parametrize(
-    "input_shape, index_pos",
-    [
-        ((32, 32), 0),
-    ],
-)
-@pytest.mark.parametrize("dtype", [torch.float32])
-def test_unsafe_index_with_none_basic_indexing(input_shape, index_pos, dtype):
-    """Basic indexing with a single tensor index and a trailing None (slice)."""
-    inp = torch.randn(input_shape, dtype=dtype, device=flag_gems.device)
-    indices = [None] * len(input_shape)
-
-    idx = torch.randint(0, input_shape[index_pos], (8,), device=flag_gems.device)
-    indices[index_pos] = idx
-
-    ref_inp = utils.to_reference(inp)
-    ref_indices = [None if idx is None else utils.to_reference(idx) for idx in indices]
-    ref_out = torch.ops.aten._unsafe_index(ref_inp, ref_indices)
-    with flag_gems.use_gems():
-        out = torch.ops.aten._unsafe_index(inp, indices)
+    out = flag_gems.unsafe_index(inp, indices)
 
     utils.gems_assert_close(out, ref_out, dtype)
 
@@ -171,80 +169,43 @@ def test_unsafe_index_with_none_and_tensor(input_shape, indices_idx, dtype):
     ref_inp = utils.to_reference(inp)
     ref_indices = [utils.to_reference(x) for x in indices]
     result_ref_ = torch.ops.aten._unsafe_index(ref_inp, ref_indices)
-    with flag_gems.use_gems():
-        result_gems_ = torch.ops.aten._unsafe_index(inp, indices)
+    result_gems_ = flag_gems.unsafe_index(inp, indices)
 
     utils.gems_assert_close(result_gems_, result_ref_, dtype)
 
 
-# _unsafe_index rejects bool masks (unlike index, which accepts them).
+# _unsafe_index only accepts int32/int64 index tensors; bool/int8/uint8/float
+# etc. are all rejected with the same RuntimeError as aten.
 @pytest.mark.unsafe_index
+@pytest.mark.parametrize(
+    "index_dtype", [torch.bool, torch.int8, torch.uint8, torch.int16, torch.float32]
+)
 @pytest.mark.parametrize("dtype", [torch.float32])
-def test_unsafe_index_rejects_bool_mask(dtype):
-    """``_unsafe_index`` rejects boolean masks (unlike ``index``, which converts
-    them to nonzero).  Calls ``flag_gems._unsafe_index`` directly so the
-    gems-side rejection (not aten's front-end check) is exercised.
+def test_unsafe_index_error_bad_index_dtype(dtype, index_dtype):
+    """Bad index dtypes are rejected with aten's exact error (RuntimeError:
+    ``_unsafe_index found unexpected index type ...``).  Calls
+    ``flag_gems.unsafe_index`` directly so the gems-side rejection (not
+    aten's front-end check) is exercised.
     """
 
     inp = torch.randn((32, 64), dtype=dtype, device=flag_gems.device)
-    mask = torch.rand(32, 64, device=flag_gems.device) > 0.5
-    indices = [mask]
+    idx = torch.randint(0, 32, (8,), device=flag_gems.device).to(index_dtype)
 
-    with pytest.raises(IndexError, match="bool or int8"):
-        flag_gems._unsafe_index(inp, indices)
+    with pytest.raises(RuntimeError, match="found unexpected index type"):
+        flag_gems.unsafe_index(inp, [idx])
 
 
-# _unsafe_index rejects int8 index tensors too (like bool masks).
 @pytest.mark.unsafe_index
 @pytest.mark.parametrize("dtype", [torch.float32])
-def test_unsafe_index_rejects_int8_mask(dtype):
-    """``_unsafe_index`` rejects int8 index tensors (like bool masks).  Calls
-    ``flag_gems._unsafe_index`` directly so the gems-side rejection (not aten's
-    front-end check) is exercised.
-    """
+def test_unsafe_index_error_non_broadcastable_indices(dtype):
+    """Non-broadcastable index tensors raise aten's IndexError."""
 
     inp = torch.randn((32, 64), dtype=dtype, device=flag_gems.device)
-    idx = torch.randint(0, 32, (8,), device=flag_gems.device).to(torch.int8)
-    indices = [idx]
+    idx1 = torch.randint(0, 32, (4,), device=flag_gems.device)
+    idx2 = torch.randint(0, 64, (3,), device=flag_gems.device)
 
-    with pytest.raises(IndexError, match="bool or int8"):
-        flag_gems._unsafe_index(inp, indices)
-
-
-@pytest.mark.unsafe_index
-@pytest.mark.parametrize("dtype", [torch.float32])
-def test_unsafe_index_empty_tensor(dtype):
-    """Indexing into a zero-size dimension must still produce the right shape."""
-
-    inp = torch.empty((0, 32), dtype=dtype, device=flag_gems.device)
-    idx = torch.empty((0,), dtype=torch.long, device=flag_gems.device)
-    indices = [idx, None]
-
-    ref_inp = utils.to_reference(inp)
-    ref_indices = [utils.to_reference(idx), None]
-    ref_out = torch.ops.aten._unsafe_index(ref_inp, ref_indices)
-    with flag_gems.use_gems():
-        out = torch.ops.aten._unsafe_index(inp, indices)
-
-    utils.gems_assert_close(out, ref_out, dtype)
-
-
-@pytest.mark.unsafe_index
-@pytest.mark.parametrize("dtype", [torch.float32])
-def test_unsafe_index_1d_special_case(dtype):
-    """1-D input indexed by a 1-D index."""
-
-    inp = torch.randn((128,), dtype=dtype, device=flag_gems.device)
-    idx = torch.randint(0, 128, (16,), device=flag_gems.device)
-    indices = [idx]
-
-    ref_inp = utils.to_reference(inp)
-    ref_indices = [utils.to_reference(idx)]
-    ref_out = torch.ops.aten._unsafe_index(ref_inp, ref_indices)
-    with flag_gems.use_gems():
-        out = torch.ops.aten._unsafe_index(inp, indices)
-
-    utils.gems_assert_close(out, ref_out, dtype)
+    with pytest.raises(IndexError, match="could not be broadcast"):
+        flag_gems.unsafe_index(inp, [idx1, idx2])
 
 
 @pytest.mark.unsafe_index
@@ -255,9 +216,8 @@ def test_unsafe_index_error_empty_indices(dtype):
     inp = torch.randn((32, 64), dtype=dtype, device=flag_gems.device)
     indices = []
 
-    with flag_gems.use_gems():
-        with pytest.raises(ValueError, match="at least one index must be provided"):
-            torch.ops.aten._unsafe_index(inp, indices)
+    with pytest.raises(ValueError, match="at least one index must be provided"):
+        flag_gems.unsafe_index(inp, indices)
 
 
 @pytest.mark.unsafe_index
@@ -271,6 +231,60 @@ def test_unsafe_index_error_too_many_indices(dtype):
     idx3 = torch.randint(0, 32, (8,), device=flag_gems.device)
     indices = [idx1, idx2, idx3]  # Too many for a 2D tensor
 
-    with flag_gems.use_gems():
-        with pytest.raises(IndexError, match="too many indices"):
-            torch.ops.aten._unsafe_index(inp, indices)
+    with pytest.raises(IndexError, match="too many indices"):
+        flag_gems.unsafe_index(inp, indices)
+
+
+@pytest.mark.unsafe_index
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_unsafe_index_non_contiguous_input(dtype):
+    """Non-contiguous input with fewer tensor indices than dims.
+
+    The gather kernel addresses the input through its full strides, so
+    non-contiguous inputs must work without any host-side normalization
+    (regression test).
+    """
+    base = torch.randn((64, 64, 64), dtype=dtype, device=flag_gems.device)
+    inp = base.permute(1, 2, 0)
+    idx = torch.randint(0, 64, (8,), device=flag_gems.device)
+    indices = [idx]
+
+    ref_inp = utils.to_reference(inp)
+    ref_indices = [utils.to_reference(idx)]
+    ref_out = torch.ops.aten._unsafe_index(ref_inp, ref_indices)
+    out = flag_gems.unsafe_index(inp, indices)
+
+    utils.gems_assert_close(out, ref_out, dtype)
+
+
+@pytest.mark.unsafe_index
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_unsafe_index_non_contiguous_input_with_none(dtype):
+    """Non-contiguous input with a trailing None (contiguous subspace, so no
+    transpose runs; the input must still be made contiguous)."""
+    base = torch.randn((64, 64, 64), dtype=dtype, device=flag_gems.device)
+    inp = base.permute(1, 2, 0)
+    idx = torch.randint(0, 64, (8,), device=flag_gems.device)
+    indices = [idx, None]
+
+    ref_inp = utils.to_reference(inp)
+    ref_indices = [utils.to_reference(idx), None]
+    ref_out = torch.ops.aten._unsafe_index(ref_inp, ref_indices)
+    out = flag_gems.unsafe_index(inp, indices)
+
+    utils.gems_assert_close(out, ref_out, dtype)
+
+
+@pytest.mark.unsafe_index
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_unsafe_index_zero_dim_index_negative(dtype):
+    """A negative 0-d index wraps like a negative integer index."""
+    inp = torch.randn((16, 16), dtype=dtype, device=flag_gems.device)
+    indices = [torch.tensor(-1, device=flag_gems.device)]
+
+    ref_inp = utils.to_reference(inp)
+    ref_indices = [utils.to_reference(indices[0])]
+    ref_out = torch.ops.aten._unsafe_index(ref_inp, ref_indices)
+    out = flag_gems.unsafe_index(inp, indices)
+
+    utils.gems_assert_close(out, ref_out, dtype)
