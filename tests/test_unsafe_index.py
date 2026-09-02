@@ -1,7 +1,3 @@
-import random
-import time
-
-import numpy as np
 import pytest
 import torch
 
@@ -45,8 +41,7 @@ UNSAFE_INDEX_ACC_SHAPE = (
     ((4, 6, 3), ((), None, (2,))),
 )
 
-# Make sure every thread has the same seed.
-random.seed(time.time() // 100)
+torch.manual_seed(0)
 
 
 def gen_indices(input_shape, indices_shape, accumulate, index_dtype=torch.int64):
@@ -78,15 +73,26 @@ def gen_indices(input_shape, indices_shape, accumulate, index_dtype=torch.int64)
                 size = min(shape[0], common_size)
             else:
                 size = ()  # 0-d index tensor
-            index = np.random.choice(
-                # [-n, n): negative entries exercise the in-kernel wrap.
-                np.arange(-input_shape[i], input_shape[i]),
-                size=size,
-                replace=accumulate,
-            )
-            indices.append(
-                torch.tensor(index, device=flag_gems.device, dtype=index_dtype)
-            )
+            n = input_shape[i]
+            if n == 0:
+                # Zero-size dim: the index tensor must be empty too.
+                indices.append(
+                    torch.empty(
+                        size if isinstance(size, tuple) else (size,),
+                        device=flag_gems.device,
+                        dtype=index_dtype,
+                    )
+                )
+                continue
+            # [-n, n): negative entries exercise the in-kernel wrap.
+            if accumulate:
+                index = torch.randint(
+                    -n, n, size if isinstance(size, tuple) else (size,)
+                )
+            else:
+                pool = torch.randperm(2 * n) - n
+                index = pool[:size] if size else pool[:1].squeeze(0)
+            indices.append(index.to(device=flag_gems.device, dtype=index_dtype))
     return indices
 
 
@@ -151,13 +157,13 @@ def test_unsafe_index_with_none_and_tensor(input_shape, indices_idx, dtype):
     """Mixed None/tensor index patterns (contiguous and non-contiguous)."""
     inp = torch.randint(0, 10000, input_shape, dtype=dtype, device=flag_gems.device)
     indices = []
-    random_idx_list_len = random.randint(0, min(input_shape) - 1)
+    random_idx_list_len = torch.randint(0, min(input_shape), (1,)).item()
     for i, idx_pos in enumerate(indices_idx):
         if idx_pos:
             indices.append(None)
         else:
             dim_len = input_shape[i]
-            random_idx = random.randint(0, dim_len - 1)
+            random_idx = torch.randint(0, dim_len, (1,)).item()
             indices.append(
                 torch.tensor(
                     [random_idx for _ in range(random_idx_list_len)],
