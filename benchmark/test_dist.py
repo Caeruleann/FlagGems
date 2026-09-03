@@ -20,8 +20,6 @@ def dist_input_fn(shape, dtype, device):
 
 
 class DistBenchmark(base.GenericBenchmark):
-    MAX_ELEMENTS = 2**28
-
     # dist flattens its inputs, so 1-D small / medium / large shapes are
     # enough: the small ones exercise the single-launch path (numel <= 16384),
     # the rest the two-stage reduction path.

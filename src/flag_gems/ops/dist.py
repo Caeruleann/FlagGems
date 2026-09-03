@@ -297,9 +297,7 @@ def dist(input, other, p=2):
                 dist_general_kernel[(1,)](input, other, out, n, p, BLOCK_SIZE=block)
             return out
 
-        mid_dtype = (
-            torch.float64 if input.dtype == torch.float64 else torch.float32
-        )
+        mid_dtype = torch.float64 if input.dtype == torch.float64 else torch.float32
         mid_size = triton.cdiv(n, BLOCK_SIZE)
         mid = torch.empty(mid_size, dtype=mid_dtype, device=input.device)
         grid_1 = (mid_size,)
