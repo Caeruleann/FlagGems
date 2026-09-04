@@ -14,25 +14,27 @@
 
 """Ascend-tuned ``unsafe_index`` (aten._unsafe_index).
 
-Three fixed (non-codegen) kernel families cover the contiguous fast paths;
-anything unusual (non-contiguous input, >4 index tensors, broadcast rank > 2,
->1 outer slice dim, offsets exceeding int32, oversized grids) falls back to
-the fully generic code-generated implementation in ``flag_gems.ops``.
+Three fixed kernel families (msprof-tuned on Ascend910B4):
+  D  1-D gather: out[i] = inp[idx[i]], contiguous 1-D input only.
+  G  point gather: no trailing slice dims; fully strided on the input side,
+     so non-contiguous inputs qualify.
+  R  row copy: trailing slice dims form a contiguous run copied in blocks;
+     indexed/outer dims may be strided.
 
-Families (msprof-tuned on Ascend910B4):
-  D  1-D gather: out[i] = inp[idx[i]].
-  G  point gather: no trailing slice dims; one output element per lane.
-  R  row copy: trailing slice dims form a contiguous run copied in blocks.
+Contiguous index tensors of any rank are flattened to rank 1 on the host (a
+view): the kernels walk the broadcast subspace linearly, matching both the
+index storage and the contiguous output.  Anything else (>4 index tensors,
+non-contiguous index views with rank > 2, non-contiguous trailing run,
+>1 outer slice dim, int32 offsets exceeded, oversized grids) falls back to
+the generic codegen implementation in ``flag_gems.ops``.
 
-Common Ascend pitfalls avoided here (measured):
-  * int64 vector where/min/max scalarize catastrophically, so index math is
-    done in int32 (fast paths are gated on all offsets fitting int32).
-  * per-lane ``%``/``//`` to recover slice coordinates destroys the
-    load/store contiguity analysis, so family R walks the contiguous run
-    with a bare arange and remaining coords are scalar per program.
-  * a single CTA for small problems wastes the device: block sizes target
-    ~32 CTAs; tiles are capped at 64 KiB to avoid UB (local buffer)
-    overflow with multi-buffering.
+Measured Ascend pitfalls avoided:
+  * int64 vector where/min/max scalarize catastrophically: index math is
+    int32, gated on all offsets fitting int32.
+  * per-lane ``%``/``//`` breaks load/store contiguity analysis: family R
+    walks the contiguous run with a bare arange.
+  * small problems need ~32 blocks to fill the device; tiles are capped at
+    64 KiB to avoid UB (local buffer) overflow with multi-buffering.
 """
 
 import logging
@@ -57,7 +59,7 @@ _MAX_GRID_AXIS = 65535
 
 
 @triton.jit
-def _ui_gather_1d_kernel(
+def _gather_1d_kernel(
     input_ptr,
     idx_ptr,
     out_ptr,
@@ -77,7 +79,7 @@ def _ui_gather_1d_kernel(
 
 
 @triton.jit
-def _ui_gather_point_kernel(
+def _gather_point_kernel(
     input_ptr,
     out_ptr,
     idx0_ptr,
@@ -153,7 +155,7 @@ def _ui_gather_point_kernel(
 
 
 @triton.jit
-def _ui_gather_rows_kernel(
+def _gather_rows_kernel(
     input_ptr,
     out_ptr,
     idx0_ptr,
@@ -234,12 +236,12 @@ def _launch_1d(inp, idx, out):
     M = out.numel()
     BLOCK = min(128, max(2, _pow2_ceil(M)))
     grid = (triton.cdiv(M, BLOCK), 1, 1)
-    _ui_gather_1d_kernel[grid](inp, idx, out, inp.shape[0], idx.stride(0), M, BLOCK=BLOCK)
+    _gather_1d_kernel[grid](inp, idx, out, inp.shape[0], idx.stride(0), M, BLOCK=BLOCK)
 
 
 def _pick_point_blocks(M, N):
-    # Point gather: small tiles, ~32+ CTAs win on Ascend.  BLOCK0 stays >= 2:
-    # a degenerate 1-lane tile breaks the Ascend BlockPtr analysis.
+    # ~32+ blocks win on Ascend; keep BLOCK0 >= 2, a 1-lane tile breaks the
+    # Ascend BlockPtr analysis.
     if N == 1:
         return min(256, max(2, _pow2_ceil(max(1, M // 32)))), 1
     BLOCK0 = min(64, _pow2_ceil(M))
@@ -301,7 +303,7 @@ def _launch_point(inp, kidx, out, idx_dims, slice_dim, bcast_pos, index_rank):
         bs1, in_ss, out_bs, out_ss,
         M, N,
     )
-    _ui_gather_point_kernel[grid](
+    _gather_point_kernel[grid](
         *args,
         NI=len(kidx),
         HAS_SLICE=slice_dim is not None,
@@ -315,8 +317,8 @@ def _pick_row_blocks(M, R, S, elem_size):
     tile_cap = 65536 // elem_size  # 64 KiB per tile (UB multibuffer limit)
     BLOCK = max(2, min(2048, _pow2_ceil(R), tile_cap))
     ROWS = min(_pow2_ceil(M), max(1, tile_cap // BLOCK))
-    # Keep at least ~32 CTAs when the problem allows it; ROWS stays >= 2
-    # because a degenerate 1-row tile breaks the Ascend BlockPtr analysis.
+    # Keep ~32 blocks when possible; ROWS stays >= 2 (a 1-row tile breaks the
+    # Ascend BlockPtr analysis).
     while ROWS > 2 and ((M + ROWS - 1) // ROWS) * ((R + BLOCK - 1) // BLOCK) * S < 32:
         ROWS //= 2
     while (
@@ -355,7 +357,7 @@ def _launch_rows(inp, kidx, out, idx_dims, outer_dim, bcast_pos, R, S, index_ran
         bs1, in_os, out_rs, out_os,
         M, R,
     )
-    _ui_gather_rows_kernel[grid](
+    _gather_rows_kernel[grid](
         *args,
         NI=len(kidx),
         HAS_OUTER=outer_dim is not None,
@@ -414,50 +416,72 @@ def unsafe_index(inp, indices):
         return out
 
     # ---- fast-path eligibility ----
+    # int32 gate: max linearized input offset, not numel (strided views can
+    # have holes).
+    max_in_offset = sum((s - 1) * st for s, st in zip(inp.shape, inp.stride()))
     if (
         len(kernel_indices) <= _MAX_IDX
-        and index_rank <= 2
-        and inp.is_contiguous()
-        and inp.numel() < _INT32_LIMIT
+        and max_in_offset < _INT32_LIMIT
         and out.numel() < _INT32_LIMIT
     ):
-        # Trailing slice run: maximal suffix of input dims that are all
-        # slices; contiguous in both input and (always-contiguous) output.
-        idx_set = set(idx_dims)
-        n_trail = 0
-        for d in range(inp.ndim - 1, -1, -1):
-            if d in idx_set:
-                break
-            n_trail += 1
-        outer_slices = slice_dims[: len(slice_dims) - n_trail]
-        if n_trail == 0 and len(slice_dims) <= 1:
-            if inp.ndim == 1 and len(kernel_indices) == 1 and index_rank == 1:
-                _launch_1d(inp, kernel_indices[0], out)
-                return out
-            slice_dim = slice_dims[0] if slice_dims else None
-            if _launch_point(
-                inp, kernel_indices, out, idx_dims, slice_dim, bcast_pos, index_rank
-            ):
-                return out
-        elif n_trail > 0 and len(outer_slices) <= 1:
-            R = 1
-            for d in range(inp.ndim - n_trail, inp.ndim):
-                R *= inp.shape[d]
-            S = inp.shape[outer_slices[0]] if outer_slices else 1
-            if S <= _MAX_GRID_AXIS:
-                outer_dim = outer_slices[0] if outer_slices else None
-                if _launch_rows(
-                    inp,
-                    kernel_indices,
-                    out,
-                    idx_dims,
-                    outer_dim,
-                    bcast_pos,
-                    R,
-                    S,
-                    index_rank,
+        # Flatten contiguous index tensors to rank 1 (a view); non-contiguous
+        # broadcast views keep the rank-2 kernel path.
+        kidx = kernel_indices
+        k_rank = index_rank
+        if k_rank > 1 and all(t.is_contiguous() for t in kidx):
+            kidx = [t.reshape(-1) for t in kidx]
+            k_rank = 1
+        if k_rank <= 2:
+            # n_trail: trailing suffix of all-slice dims; family R additionally
+            # needs this run contiguous in the input.
+            idx_set = set(idx_dims)
+            n_trail = 0
+            for d in range(inp.ndim - 1, -1, -1):
+                if d in idx_set:
+                    break
+                n_trail += 1
+            outer_slices = slice_dims[: len(slice_dims) - n_trail]
+            trail_contig = True
+            if n_trail:
+                expect = 1
+                for d in range(inp.ndim - 1, inp.ndim - n_trail - 1, -1):
+                    if inp.stride(d) != expect:
+                        trail_contig = False
+                        break
+                    expect *= inp.shape[d]
+            if n_trail == 0 and len(slice_dims) <= 1:
+                if (
+                    inp.ndim == 1
+                    and len(kidx) == 1
+                    and k_rank == 1
+                    and inp.is_contiguous()
+                ):
+                    _launch_1d(inp, kidx[0], out)
+                    return out
+                slice_dim = slice_dims[0] if slice_dims else None
+                if _launch_point(
+                    inp, kidx, out, idx_dims, slice_dim, bcast_pos, k_rank
                 ):
                     return out
+            elif n_trail > 0 and len(outer_slices) <= 1 and trail_contig:
+                R = 1
+                for d in range(inp.ndim - n_trail, inp.ndim):
+                    R *= inp.shape[d]
+                S = inp.shape[outer_slices[0]] if outer_slices else 1
+                if S <= _MAX_GRID_AXIS:
+                    outer_dim = outer_slices[0] if outer_slices else None
+                    if _launch_rows(
+                        inp,
+                        kidx,
+                        out,
+                        idx_dims,
+                        outer_dim,
+                        bcast_pos,
+                        R,
+                        S,
+                        k_rank,
+                    ):
+                        return out
 
     # Generic fallback (already-prepared arguments, full-stride codegen).
     _unsafe_index_func(inp, kernel_indices, out, idx_dims, bcast_pos)
