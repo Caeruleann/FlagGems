@@ -294,14 +294,34 @@ def _launch_point(inp, kidx, out, idx_dims, slice_dim, bcast_pos, index_rank):
         return False
     grid = (triton.cdiv(M, BLOCK0), triton.cdiv(N, BLOCK1), 1)
     args = (
-        inp, out,
-        ptrs[0], ptrs[1], ptrs[2], ptrs[3],
-        ish[0], ish[1], ish[2], ish[3],
-        iss[0], iss[1], iss[2], iss[3],
-        bstr[0], bstr[1], bstr[2], bstr[3],
-        bstr[4], bstr[5], bstr[6], bstr[7],
-        bs1, in_ss, out_bs, out_ss,
-        M, N,
+        inp,
+        out,
+        ptrs[0],
+        ptrs[1],
+        ptrs[2],
+        ptrs[3],
+        ish[0],
+        ish[1],
+        ish[2],
+        ish[3],
+        iss[0],
+        iss[1],
+        iss[2],
+        iss[3],
+        bstr[0],
+        bstr[1],
+        bstr[2],
+        bstr[3],
+        bstr[4],
+        bstr[5],
+        bstr[6],
+        bstr[7],
+        bs1,
+        in_ss,
+        out_bs,
+        out_ss,
+        M,
+        N,
     )
     _gather_point_kernel[grid](
         *args,
@@ -321,10 +341,7 @@ def _pick_row_blocks(M, R, S, elem_size):
     # Ascend BlockPtr analysis).
     while ROWS > 2 and ((M + ROWS - 1) // ROWS) * ((R + BLOCK - 1) // BLOCK) * S < 32:
         ROWS //= 2
-    while (
-        BLOCK > 64
-        and ((M + ROWS - 1) // ROWS) * ((R + BLOCK - 1) // BLOCK) * S < 32
-    ):
+    while BLOCK > 64 and ((M + ROWS - 1) // ROWS) * ((R + BLOCK - 1) // BLOCK) * S < 32:
         BLOCK //= 2
     return max(ROWS, 2), BLOCK
 
@@ -348,14 +365,34 @@ def _launch_rows(inp, kidx, out, idx_dims, outer_dim, bcast_pos, R, S, index_ran
         return False
     grid = (triton.cdiv(M, ROWS), triton.cdiv(R, BLOCK), S)
     args = (
-        inp, out,
-        ptrs[0], ptrs[1], ptrs[2], ptrs[3],
-        ish[0], ish[1], ish[2], ish[3],
-        iss[0], iss[1], iss[2], iss[3],
-        bstr[0], bstr[1], bstr[2], bstr[3],
-        bstr[4], bstr[5], bstr[6], bstr[7],
-        bs1, in_os, out_rs, out_os,
-        M, R,
+        inp,
+        out,
+        ptrs[0],
+        ptrs[1],
+        ptrs[2],
+        ptrs[3],
+        ish[0],
+        ish[1],
+        ish[2],
+        ish[3],
+        iss[0],
+        iss[1],
+        iss[2],
+        iss[3],
+        bstr[0],
+        bstr[1],
+        bstr[2],
+        bstr[3],
+        bstr[4],
+        bstr[5],
+        bstr[6],
+        bstr[7],
+        bs1,
+        in_os,
+        out_rs,
+        out_os,
+        M,
+        R,
     )
     _gather_rows_kernel[grid](
         *args,
