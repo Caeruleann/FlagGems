@@ -39,6 +39,7 @@ from .cumsum import cumsum, normed_cumsum
 from .diag import diag
 from .diag_embed import diag_embed
 from .diagonal import diagonal_backward
+from .dist import dist
 from .dot import dot
 from .embedding import embedding
 from .exponential import exponential
@@ -64,6 +65,7 @@ from .linalg_lstsq import linalg_lstsq
 from .linalg_lu import linalg_lu, linalg_lu_out
 from .linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
 from .linalg_lu_factor_ex import linalg_lu_factor_ex, linalg_lu_factor_ex_out
+from .linalg_qr import linalg_qr, linalg_qr_out
 from .linspace import linspace
 from .log_sigmoid_backward import log_sigmoid_backward, log_sigmoid_backward_out
 from .log_softmax import log_softmax, log_softmax_backward, log_softmax_out
@@ -155,6 +157,7 @@ __all__ = [
     "diag",
     "diag_embed",
     "diagonal_backward",
+    "dist",
     "dot",
     "embedding",
     "exponential",
@@ -196,6 +199,8 @@ __all__ = [
     "linalg_lu_factor_ex_out",
     "linalg_lu_factor_out",
     "linalg_lu_out",
+    "linalg_qr",
+    "linalg_qr_out",
     "linspace",
     "log_sigmoid_backward",
     "log_sigmoid_backward_out",
